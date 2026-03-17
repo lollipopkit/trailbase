@@ -30,6 +30,7 @@ use crate::constants::{
 #[derive(Debug, Deserialize, Serialize)]
 struct AuthQuery {
   response_type: String,
+  response_mode: Option<String>,
   client_id: String,
   state: String,
   code_challenge: String,
@@ -373,6 +374,55 @@ async fn test_oauth_login_flow_with_pkce() {
     db_user.uuid().into_bytes()
   );
   assert_eq!(EXTERNAL_USER_EMAIL, decoded_claims.email);
+}
+
+#[tokio::test]
+async fn test_apple_oauth_login_uses_form_post_when_requesting_name_and_email() {
+  let site_url = "https://bar.org";
+  let state = test_state(Some(TestStateOptions {
+    config: Some({
+      let mut config = Config::new_with_custom_defaults();
+      config.server.site_url = Some(site_url.to_string());
+      config.auth.oauth_providers = [(
+        "apple".to_string(),
+        OAuthProviderConfig {
+          client_id: Some("apple.test.client".to_string()),
+          client_secret: Some("apple.test.secret".to_string()),
+          provider_id: Some(OAuthProviderId::Apple as i32),
+          ..Default::default()
+        },
+      )]
+      .into();
+      config
+    }),
+    ..Default::default()
+  }))
+  .await
+  .unwrap();
+
+  let external_redirect: Redirect = login::login_with_external_auth_provider(
+    State(state),
+    Path("apple".to_string()),
+    Query(LoginInputParams {
+      redirect_uri: Some(format!("{site_url}/login-success-welcome")),
+      mfa_redirect_uri: None,
+      response_type: None,
+      pkce_code_challenge: None,
+    }),
+    Cookies::default(),
+  )
+  .await
+  .unwrap();
+
+  let redirect_location = get_redirect_location(external_redirect).unwrap();
+  let redirect_url = url::Url::parse(&redirect_location).unwrap();
+  let query_params: HashMap<Cow<'_, str>, Cow<'_, str>> = redirect_url.query_pairs().collect();
+
+  assert_eq!(redirect_url.scheme(), "https");
+  assert_eq!(redirect_url.host_str(), Some("appleid.apple.com"));
+  assert_eq!(redirect_url.path(), "/auth/authorize");
+  assert_eq!(query_params.get("scope").unwrap(), "name email");
+  assert_eq!(query_params.get("response_mode").unwrap(), "form_post");
 }
 
 fn get_redirect_location<T: IntoResponse>(response: T) -> Option<String> {

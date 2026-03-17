@@ -107,6 +107,10 @@ pub trait OAuthProvider {
 
   fn oauth_scopes(&self) -> Vec<&'static str>;
 
+  fn oauth_authorize_params(&self) -> Vec<(&'static str, &'static str)> {
+    return vec![];
+  }
+
   //async fn get_user(&self, access_token: &oauth2::AccessToken) -> Result<OAuthUser, AuthError>;
   async fn get_user(&self, token_response: &TokenResponse) -> Result<OAuthUser, AuthError>;
 }

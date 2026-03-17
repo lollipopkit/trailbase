@@ -141,6 +141,10 @@ impl OAuthProvider for AppleOAuthProvider {
     return vec!["name", "email"];
   }
 
+  fn oauth_authorize_params(&self) -> Vec<(&'static str, &'static str)> {
+    return vec![("response_mode", "form_post")];
+  }
+
   async fn get_user(&self, token_response: &TokenResponse) -> Result<OAuthUser, AuthError> {
     let Some(ref id_token) = token_response.extra_fields().id_token else {
       return Err(AuthError::BadRequest("missing id token"));
