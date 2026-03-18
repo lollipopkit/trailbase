@@ -190,12 +190,13 @@ impl OAuthProvider for WeChatOAuthProvider {
 
     let csrf_state = CsrfToken::new_random();
     let csrf_secret = csrf_state.secret().to_string();
+    let scope = self.oauth_scopes().join(" ");
     let mut auth_url = Url::parse(Self::AUTH_URL).expect("infallible");
     auth_url.query_pairs_mut().extend_pairs([
       ("appid", self.client_id.as_str()),
       ("redirect_uri", redirect_url.as_str()),
       ("response_type", "code"),
-      ("scope", "snsapi_login"),
+      ("scope", scope.as_str()),
       ("state", csrf_secret.as_str()),
     ]);
 
@@ -342,11 +343,12 @@ mod tests {
       .unwrap();
     let (pkce_code_challenge, _) = PkceCodeChallenge::new_random_sha256();
     let (authorize_url, csrf_state) = provider.authorize_url(&state, pkce_code_challenge).unwrap();
+    let expected_scope = provider.oauth_scopes().join(" ");
 
     let query: HashMap<_, _> = authorize_url.query_pairs().collect();
     assert_eq!(query.get("appid").unwrap(), "wechat-app-id");
     assert_eq!(query.get("response_type").unwrap(), "code");
-    assert_eq!(query.get("scope").unwrap(), "snsapi_login");
+    assert_eq!(query.get("scope").unwrap(), &expected_scope);
     assert_eq!(query.get("state").unwrap(), csrf_state.secret());
     assert_eq!(
       query.get("redirect_uri").unwrap(),
