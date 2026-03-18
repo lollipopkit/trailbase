@@ -9,7 +9,7 @@ use crate::app_state::AppState;
 use crate::auth::AuthError;
 use crate::auth::oauth::provider::{TokenResponse, build_oauth_http_client};
 use crate::auth::oauth::providers::{OAuthProviderError, OAuthProviderFactory};
-use crate::auth::oauth::{OAuthClientSettings, OAuthProvider, OAuthUser};
+use crate::auth::oauth::{OAuthClientSettings, OAuthProvider, OAuthUser, WECHAT_SYNTHETIC_EMAIL_DOMAIN};
 use crate::config::proto::{OAuthProviderConfig, OAuthProviderId};
 use crate::constants::AUTH_API_PATH;
 
@@ -39,7 +39,6 @@ impl WeChatOAuthProvider {
   const AUTH_URL: &'static str = "https://open.weixin.qq.com/connect/qrconnect#wechat_redirect";
   const TOKEN_URL: &'static str = "https://api.weixin.qq.com/sns/oauth2/access_token";
   const USER_API_URL: &'static str = "https://api.weixin.qq.com/sns/userinfo";
-  const SYNTHETIC_EMAIL_DOMAIN: &'static str = "wechat.oauth.invalid";
 
   fn new(config: &OAuthProviderConfig) -> Result<Self, OAuthProviderError> {
     let Some(client_id) = config.client_id.clone() else {
@@ -70,7 +69,7 @@ impl WeChatOAuthProvider {
 
   fn synthetic_email(provider_user_id: &str) -> String {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(provider_user_id);
-    format!("{encoded}@{}", Self::SYNTHETIC_EMAIL_DOMAIN)
+    format!("{encoded}@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
   }
 
   async fn exchange_code(
@@ -235,7 +234,10 @@ mod tests {
   fn synthetic_email_is_stable_and_non_deliverable() {
     let email = WeChatOAuthProvider::synthetic_email("unionid-123");
 
-    assert_eq!(email, "dW5pb25pZC0xMjM@wechat.oauth.invalid");
+    assert_eq!(
+      email,
+      format!("dW5pb25pZC0xMjM@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
+    );
   }
 
   #[test]

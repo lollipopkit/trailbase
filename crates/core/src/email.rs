@@ -8,6 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::AppState;
+use crate::auth::oauth::WECHAT_SYNTHETIC_EMAIL_DOMAIN;
 use crate::config::proto::{Config, EmailConfig, SmtpEncryption};
 use crate::constants::AUTH_API_PATH;
 
@@ -75,6 +76,14 @@ impl Email {
       subject,
       body,
     } = self;
+
+    #[cfg(test)]
+    let _ = dev;
+
+    if should_skip_delivery(to) {
+      info!("Skip sending email to synthetic address:\nFROM: {from}\nTO: {to}\nSUBJECT: {subject}");
+      return Ok(());
+    }
 
     let email = Message::builder()
       .to(to.clone())
@@ -292,6 +301,10 @@ impl Email {
   }
 }
 
+fn should_skip_delivery(to: &Mailbox) -> bool {
+  return to.email.domain() == WECHAT_SYNTHETIC_EMAIL_DOMAIN;
+}
+
 fn get_sender(state: &AppState) -> Result<Mailbox, EmailError> {
   let (sender_address, sender_name) =
     state.access_config(|c| (c.email.sender_address.clone(), c.email.sender_name.clone()));
@@ -417,7 +430,7 @@ pub mod testing {
   use std::sync::Arc;
 
   use super::*;
-  use crate::app_state::test_state;
+  use crate::app_state::{TestStateOptions, test_state};
 
   #[derive(Clone)]
   pub struct TestAsyncSmtpTransport {
@@ -520,5 +533,29 @@ pub mod testing {
     let url = Some(url::Url::parse("https://test.org").unwrap());
     let sender = fallback_sender(&url);
     assert_eq!("noreply@test.org", sender);
+  }
+
+  #[tokio::test]
+  async fn skips_sending_to_wechat_synthetic_email_domain() {
+    let mailer = TestAsyncSmtpTransport::new();
+    let state = test_state(Some(TestStateOptions {
+      mailer: Some(Mailer::Smtp(Arc::new(mailer.clone()))),
+      ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let email = Email::new(
+      &state,
+      &format!("unionid@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}"),
+      "Synthetic subject".to_string(),
+      "Synthetic body".to_string(),
+    )
+    .unwrap();
+
+    email.send().await.unwrap();
+
+    assert!(should_skip_delivery(&email.to));
+    assert!(mailer.get_logs().is_empty());
   }
 }

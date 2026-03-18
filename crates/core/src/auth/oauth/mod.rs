@@ -15,6 +15,8 @@ use utoipa::OpenApi;
 
 pub(crate) use provider::{OAuthClientSettings, OAuthProvider, OAuthUser};
 
+pub(crate) const WECHAT_SYNTHETIC_EMAIL_DOMAIN: &str = "wechat.oauth.invalid";
+
 use crate::AppState;
 
 #[derive(OpenApi)]
