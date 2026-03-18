@@ -3,7 +3,7 @@ use axum::{
   response::Redirect,
 };
 use chrono::Duration;
-use oauth2::{CsrfToken, PkceCodeChallenge, Scope};
+use oauth2::PkceCodeChallenge;
 use tower_cookies::Cookies;
 
 use crate::AppState;
@@ -40,26 +40,7 @@ pub(crate) async fn login_with_external_auth_provider(
   let (server_pkce_code_challenge, server_pkce_code_verifier) =
     PkceCodeChallenge::new_random_sha256();
 
-  let oauth_client = provider.oauth_client(&state)?;
-
-  let authorize_request = oauth_client
-    .authorize_url(CsrfToken::new_random)
-    .add_scopes(
-      provider
-        .oauth_scopes()
-        .into_iter()
-        .map(|s| Scope::new(s.to_string())),
-    )
-    .set_pkce_challenge(server_pkce_code_challenge);
-
-  let authorize_request = provider
-    .oauth_authorize_params()
-    .into_iter()
-    .fold(authorize_request, |request, (name, value)| {
-      request.add_extra_param(name, value)
-    });
-
-  let (authorize_url, csrf_state) = authorize_request.url();
+  let (authorize_url, csrf_state) = provider.authorize_url(&state, server_pkce_code_challenge)?;
 
   let oauth_state = match login_params {
     LoginParams::Password { redirect_uri } => OAuthStateClaims {

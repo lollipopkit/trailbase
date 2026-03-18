@@ -66,6 +66,7 @@ export const assets = new Map<OAuthProviderId, string>([
   [OAuthProviderId.GOOGLE, google],
   [OAuthProviderId.MICROSOFT, microsoft],
   [OAuthProviderId.TWITCH, twitch],
+  [OAuthProviderId.WECHAT, openIdConnect],
   [OAuthProviderId.YANDEX, yandex],
 ]);
 
