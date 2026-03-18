@@ -66,6 +66,7 @@ export enum OAuthProviderId {
   MICROSOFT = 14,
   TWITCH = 15,
   YANDEX = 16,
+  WECHAT = 17,
   UNRECOGNIZED = -1,
 }
 
@@ -104,6 +105,9 @@ export function oAuthProviderIdFromJSON(object: any): OAuthProviderId {
     case 16:
     case "YANDEX":
       return OAuthProviderId.YANDEX;
+    case 17:
+    case "WECHAT":
+      return OAuthProviderId.WECHAT;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -135,6 +139,8 @@ export function oAuthProviderIdToJSON(object: OAuthProviderId): string {
       return "TWITCH";
     case OAuthProviderId.YANDEX:
       return "YANDEX";
+    case OAuthProviderId.WECHAT:
+      return "WECHAT";
     case OAuthProviderId.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -349,8 +355,8 @@ export interface EmailConfig {
   smtpPort?: number | undefined;
   smtpUsername?: string | undefined;
   smtpPassword?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /** Which encryption method to use. STARTTLS by default. */
   smtpEncryption?: SmtpEncryption | undefined;
   senderName?: string | undefined;
@@ -365,8 +371,8 @@ export interface OAuthProviderConfig {
   clientId?: string | undefined;
   clientSecret?: string | undefined;
   providerId?:
-    | OAuthProviderId
-    | undefined;
+  | OAuthProviderId
+  | undefined;
   /**
    * Settings for generic OpenID Connect provider. Name is implicitly provided
    * via the `AuthConfig.oauth_provders` map key.
@@ -380,40 +386,40 @@ export interface OAuthProviderConfig {
 export interface AuthConfig {
   /** / Time-to-live in seconds for auth tokens. Default: 1h. */
   authTokenTtlSec?:
-    | bigint
-    | undefined;
+  | bigint
+  | undefined;
   /** / Time-to-live in seconds for refresh tokens. Default: 30 days. */
   refreshTokenTtlSec?:
-    | bigint
-    | undefined;
+  | bigint
+  | undefined;
   /** / Disables password-based sign-up. Does not affect already registered users. */
   disablePasswordAuth?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /**
    * / Whether sign-in via OTP codes (e.g. sent via Email) should be allowed.
    * / This may be less secure since ultimately you're delegating operational
    * / security to a user's inbox.
    */
   enableOtpSignin?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /** / Minimal password length. Defaults to 8. */
   passwordMinimalLength?:
-    | number
-    | undefined;
+  | number
+  | undefined;
   /** / Password must contain lower and upper-case letters. */
   passwordMustContainUpperAndLowerCase?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /** / Password must contain digits in addition to alphabetic characters.. */
   passwordMustContainDigits?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /** / Password must contain special, non-alphanumeric, characters. */
   passwordMustContainSpecialCharacters?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /** / Map of configured OAuth providers. */
   oauthProviders: { [key: string]: OAuthProviderConfig };
   /**
@@ -434,12 +440,12 @@ export interface S3StorageConfig {
   endpoint?: string | undefined;
   region?: string | undefined;
   bucketName?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /** / S3 access key, a.k.a. username. */
   accessKey?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /** / S3 secret access key, a.k.a. password. */
   secretAccessKey?: string | undefined;
 }
@@ -450,27 +456,27 @@ export interface ServerConfig {
    * / "TrailBase".
    */
   applicationName?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /**
    * / Your final, deployed URL. This url is used to build canonical urls
    * / for emails, OAuth redirects, ... . Default: "http://localhost:4000".
    */
   siteUrl?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /**
    * /  Max age of logs that will be retained during period logs cleanup. Note
    * /  that this implies that some older logs may persist until the cleanup job
    * /  reruns. Default: 7 days.
    */
   logsRetentionSec?:
-    | bigint
-    | undefined;
+  | bigint
+  | undefined;
   /** / If present will use S3 setup over local file-system based storage. */
   s3StorageConfig?:
-    | S3StorageConfig
-    | undefined;
+  | S3StorageConfig
+  | undefined;
   /** / If enabled, batches of transactions can be submitted for attomic execution */
   enableRecordTransactions?: boolean | undefined;
 }
@@ -478,15 +484,15 @@ export interface ServerConfig {
 export interface SystemJob {
   /** / Identifies the system job by its id. */
   id?:
-    | SystemJobId
-    | undefined;
+  | SystemJobId
+  | undefined;
   /**
    * / Cron spec: shorthand or 7-components: (sec, min, hour, day of month, /
    * / month, day of week, year).
    */
   schedule?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /** / Disable the system job. */
   disabled?: boolean | undefined;
 }
@@ -504,12 +510,12 @@ export interface JobsConfig {
 export interface RecordApiConfig {
   /** / API name, i.e. unique name used to access data via HTTP. */
   name?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /** / Referenced table to be exposed. */
   tableName?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /**
    * / Attached databases - will `ATTACH <traildepot>/data/<name>.db AS <name>`.
    * / Can only reference configured databases.
@@ -517,8 +523,8 @@ export interface RecordApiConfig {
   attachedDatabases: string[];
   /** / Strategy to be used on insert if a table constraint is violated. */
   conflictResolution?:
-    | ConflictResolutionStrategy
-    | undefined;
+  | ConflictResolutionStrategy
+  | undefined;
   /**
    * / Fill columns referencing _user(id) automatically from current user's
    * / authentication context if present. Can be useful for static clients, such
@@ -526,8 +532,8 @@ export interface RecordApiConfig {
    * / ids explicitly and to keep this feature off.
    */
   autofillMissingUserIdColumns?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /**
    * / Allow subscribing to data changes in realtime using SSE streaming.
    * /
@@ -536,8 +542,8 @@ export interface RecordApiConfig {
    * / tell the proxy to keep listening and not cache.
    */
   enableSubscriptions?:
-    | boolean
-    | undefined;
+  | boolean
+  | undefined;
   /** / Access control lists. */
   aclWorld: PermissionFlag[];
   aclAuthenticated: PermissionFlag[];
@@ -571,8 +577,8 @@ export interface RecordApiConfig {
   updateAccessRule?: string | undefined;
   deleteAccessRule?: string | undefined;
   schemaAccessRule?:
-    | string
-    | undefined;
+  | string
+  | undefined;
   /**
    * / A list of foreign key columns that *can* be expanded on read/list, i.e.
    * / the foreign record will be inlined into the response. By default nothing
@@ -838,58 +844,58 @@ export const EmailConfig: MessageFns<EmailConfig> = {
       smtpHost: isSet(object.smtpHost)
         ? globalThis.String(object.smtpHost)
         : isSet(object.smtp_host)
-        ? globalThis.String(object.smtp_host)
-        : undefined,
+          ? globalThis.String(object.smtp_host)
+          : undefined,
       smtpPort: isSet(object.smtpPort)
         ? globalThis.Number(object.smtpPort)
         : isSet(object.smtp_port)
-        ? globalThis.Number(object.smtp_port)
-        : undefined,
+          ? globalThis.Number(object.smtp_port)
+          : undefined,
       smtpUsername: isSet(object.smtpUsername)
         ? globalThis.String(object.smtpUsername)
         : isSet(object.smtp_username)
-        ? globalThis.String(object.smtp_username)
-        : undefined,
+          ? globalThis.String(object.smtp_username)
+          : undefined,
       smtpPassword: isSet(object.smtpPassword)
         ? globalThis.String(object.smtpPassword)
         : isSet(object.smtp_password)
-        ? globalThis.String(object.smtp_password)
-        : undefined,
+          ? globalThis.String(object.smtp_password)
+          : undefined,
       smtpEncryption: isSet(object.smtpEncryption)
         ? smtpEncryptionFromJSON(object.smtpEncryption)
         : isSet(object.smtp_encryption)
-        ? smtpEncryptionFromJSON(object.smtp_encryption)
-        : undefined,
+          ? smtpEncryptionFromJSON(object.smtp_encryption)
+          : undefined,
       senderName: isSet(object.senderName)
         ? globalThis.String(object.senderName)
         : isSet(object.sender_name)
-        ? globalThis.String(object.sender_name)
-        : undefined,
+          ? globalThis.String(object.sender_name)
+          : undefined,
       senderAddress: isSet(object.senderAddress)
         ? globalThis.String(object.senderAddress)
         : isSet(object.sender_address)
-        ? globalThis.String(object.sender_address)
-        : undefined,
+          ? globalThis.String(object.sender_address)
+          : undefined,
       userVerificationTemplate: isSet(object.userVerificationTemplate)
         ? EmailTemplate.fromJSON(object.userVerificationTemplate)
         : isSet(object.user_verification_template)
-        ? EmailTemplate.fromJSON(object.user_verification_template)
-        : undefined,
+          ? EmailTemplate.fromJSON(object.user_verification_template)
+          : undefined,
       passwordResetTemplate: isSet(object.passwordResetTemplate)
         ? EmailTemplate.fromJSON(object.passwordResetTemplate)
         : isSet(object.password_reset_template)
-        ? EmailTemplate.fromJSON(object.password_reset_template)
-        : undefined,
+          ? EmailTemplate.fromJSON(object.password_reset_template)
+          : undefined,
       changeEmailTemplate: isSet(object.changeEmailTemplate)
         ? EmailTemplate.fromJSON(object.changeEmailTemplate)
         : isSet(object.change_email_template)
-        ? EmailTemplate.fromJSON(object.change_email_template)
-        : undefined,
+          ? EmailTemplate.fromJSON(object.change_email_template)
+          : undefined,
       otpTemplate: isSet(object.otpTemplate)
         ? EmailTemplate.fromJSON(object.otpTemplate)
         : isSet(object.otp_template)
-        ? EmailTemplate.fromJSON(object.otp_template)
-        : undefined,
+          ? EmailTemplate.fromJSON(object.otp_template)
+          : undefined,
     };
   },
 
@@ -1068,38 +1074,38 @@ export const OAuthProviderConfig: MessageFns<OAuthProviderConfig> = {
       clientId: isSet(object.clientId)
         ? globalThis.String(object.clientId)
         : isSet(object.client_id)
-        ? globalThis.String(object.client_id)
-        : undefined,
+          ? globalThis.String(object.client_id)
+          : undefined,
       clientSecret: isSet(object.clientSecret)
         ? globalThis.String(object.clientSecret)
         : isSet(object.client_secret)
-        ? globalThis.String(object.client_secret)
-        : undefined,
+          ? globalThis.String(object.client_secret)
+          : undefined,
       providerId: isSet(object.providerId)
         ? oAuthProviderIdFromJSON(object.providerId)
         : isSet(object.provider_id)
-        ? oAuthProviderIdFromJSON(object.provider_id)
-        : undefined,
+          ? oAuthProviderIdFromJSON(object.provider_id)
+          : undefined,
       displayName: isSet(object.displayName)
         ? globalThis.String(object.displayName)
         : isSet(object.display_name)
-        ? globalThis.String(object.display_name)
-        : undefined,
+          ? globalThis.String(object.display_name)
+          : undefined,
       authUrl: isSet(object.authUrl)
         ? globalThis.String(object.authUrl)
         : isSet(object.auth_url)
-        ? globalThis.String(object.auth_url)
-        : undefined,
+          ? globalThis.String(object.auth_url)
+          : undefined,
       tokenUrl: isSet(object.tokenUrl)
         ? globalThis.String(object.tokenUrl)
         : isSet(object.token_url)
-        ? globalThis.String(object.token_url)
-        : undefined,
+          ? globalThis.String(object.token_url)
+          : undefined,
       userApiUrl: isSet(object.userApiUrl)
         ? globalThis.String(object.userApiUrl)
         : isSet(object.user_api_url)
-        ? globalThis.String(object.user_api_url)
-        : undefined,
+          ? globalThis.String(object.user_api_url)
+          : undefined,
     };
   },
 
@@ -1300,43 +1306,43 @@ export const AuthConfig: MessageFns<AuthConfig> = {
       authTokenTtlSec: isSet(object.authTokenTtlSec)
         ? BigInt(object.authTokenTtlSec)
         : isSet(object.auth_token_ttl_sec)
-        ? BigInt(object.auth_token_ttl_sec)
-        : undefined,
+          ? BigInt(object.auth_token_ttl_sec)
+          : undefined,
       refreshTokenTtlSec: isSet(object.refreshTokenTtlSec)
         ? BigInt(object.refreshTokenTtlSec)
         : isSet(object.refresh_token_ttl_sec)
-        ? BigInt(object.refresh_token_ttl_sec)
-        : undefined,
+          ? BigInt(object.refresh_token_ttl_sec)
+          : undefined,
       disablePasswordAuth: isSet(object.disablePasswordAuth)
         ? globalThis.Boolean(object.disablePasswordAuth)
         : isSet(object.disable_password_auth)
-        ? globalThis.Boolean(object.disable_password_auth)
-        : undefined,
+          ? globalThis.Boolean(object.disable_password_auth)
+          : undefined,
       enableOtpSignin: isSet(object.enableOtpSignin)
         ? globalThis.Boolean(object.enableOtpSignin)
         : isSet(object.enable_otp_signin)
-        ? globalThis.Boolean(object.enable_otp_signin)
-        : undefined,
+          ? globalThis.Boolean(object.enable_otp_signin)
+          : undefined,
       passwordMinimalLength: isSet(object.passwordMinimalLength)
         ? globalThis.Number(object.passwordMinimalLength)
         : isSet(object.password_minimal_length)
-        ? globalThis.Number(object.password_minimal_length)
-        : undefined,
+          ? globalThis.Number(object.password_minimal_length)
+          : undefined,
       passwordMustContainUpperAndLowerCase: isSet(object.passwordMustContainUpperAndLowerCase)
         ? globalThis.Boolean(object.passwordMustContainUpperAndLowerCase)
         : isSet(object.password_must_contain_upper_and_lower_case)
-        ? globalThis.Boolean(object.password_must_contain_upper_and_lower_case)
-        : undefined,
+          ? globalThis.Boolean(object.password_must_contain_upper_and_lower_case)
+          : undefined,
       passwordMustContainDigits: isSet(object.passwordMustContainDigits)
         ? globalThis.Boolean(object.passwordMustContainDigits)
         : isSet(object.password_must_contain_digits)
-        ? globalThis.Boolean(object.password_must_contain_digits)
-        : undefined,
+          ? globalThis.Boolean(object.password_must_contain_digits)
+          : undefined,
       passwordMustContainSpecialCharacters: isSet(object.passwordMustContainSpecialCharacters)
         ? globalThis.Boolean(object.passwordMustContainSpecialCharacters)
         : isSet(object.password_must_contain_special_characters)
-        ? globalThis.Boolean(object.password_must_contain_special_characters)
-        : undefined,
+          ? globalThis.Boolean(object.password_must_contain_special_characters)
+          : undefined,
       oauthProviders: isObject(object.oauthProviders)
         ? (globalThis.Object.entries(object.oauthProviders) as [string, any][]).reduce(
           (acc: { [key: string]: OAuthProviderConfig }, [key, value]: [string, any]) => {
@@ -1346,19 +1352,19 @@ export const AuthConfig: MessageFns<AuthConfig> = {
           {},
         )
         : isObject(object.oauth_providers)
-        ? (globalThis.Object.entries(object.oauth_providers) as [string, any][]).reduce(
-          (acc: { [key: string]: OAuthProviderConfig }, [key, value]: [string, any]) => {
-            acc[key] = OAuthProviderConfig.fromJSON(value);
-            return acc;
-          },
-          {},
-        )
-        : {},
+          ? (globalThis.Object.entries(object.oauth_providers) as [string, any][]).reduce(
+            (acc: { [key: string]: OAuthProviderConfig }, [key, value]: [string, any]) => {
+              acc[key] = OAuthProviderConfig.fromJSON(value);
+              return acc;
+            },
+            {},
+          )
+          : {},
       customUriSchemes: globalThis.Array.isArray(object?.customUriSchemes)
         ? object.customUriSchemes.map((e: any) => globalThis.String(e))
         : globalThis.Array.isArray(object?.custom_uri_schemes)
-        ? object.custom_uri_schemes.map((e: any) => globalThis.String(e))
-        : [],
+          ? object.custom_uri_schemes.map((e: any) => globalThis.String(e))
+          : [],
     };
   },
 
@@ -1601,18 +1607,18 @@ export const S3StorageConfig: MessageFns<S3StorageConfig> = {
       bucketName: isSet(object.bucketName)
         ? globalThis.String(object.bucketName)
         : isSet(object.bucket_name)
-        ? globalThis.String(object.bucket_name)
-        : undefined,
+          ? globalThis.String(object.bucket_name)
+          : undefined,
       accessKey: isSet(object.accessKey)
         ? globalThis.String(object.accessKey)
         : isSet(object.access_key)
-        ? globalThis.String(object.access_key)
-        : undefined,
+          ? globalThis.String(object.access_key)
+          : undefined,
       secretAccessKey: isSet(object.secretAccessKey)
         ? globalThis.String(object.secretAccessKey)
         : isSet(object.secret_access_key)
-        ? globalThis.String(object.secret_access_key)
-        : undefined,
+          ? globalThis.String(object.secret_access_key)
+          : undefined,
     };
   },
 
@@ -1738,28 +1744,28 @@ export const ServerConfig: MessageFns<ServerConfig> = {
       applicationName: isSet(object.applicationName)
         ? globalThis.String(object.applicationName)
         : isSet(object.application_name)
-        ? globalThis.String(object.application_name)
-        : undefined,
+          ? globalThis.String(object.application_name)
+          : undefined,
       siteUrl: isSet(object.siteUrl)
         ? globalThis.String(object.siteUrl)
         : isSet(object.site_url)
-        ? globalThis.String(object.site_url)
-        : undefined,
+          ? globalThis.String(object.site_url)
+          : undefined,
       logsRetentionSec: isSet(object.logsRetentionSec)
         ? BigInt(object.logsRetentionSec)
         : isSet(object.logs_retention_sec)
-        ? BigInt(object.logs_retention_sec)
-        : undefined,
+          ? BigInt(object.logs_retention_sec)
+          : undefined,
       s3StorageConfig: isSet(object.s3StorageConfig)
         ? S3StorageConfig.fromJSON(object.s3StorageConfig)
         : isSet(object.s3_storage_config)
-        ? S3StorageConfig.fromJSON(object.s3_storage_config)
-        : undefined,
+          ? S3StorageConfig.fromJSON(object.s3_storage_config)
+          : undefined,
       enableRecordTransactions: isSet(object.enableRecordTransactions)
         ? globalThis.Boolean(object.enableRecordTransactions)
         : isSet(object.enable_record_transactions)
-        ? globalThis.Boolean(object.enable_record_transactions)
-        : undefined,
+          ? globalThis.Boolean(object.enable_record_transactions)
+          : undefined,
     };
   },
 
@@ -1932,8 +1938,8 @@ export const JobsConfig: MessageFns<JobsConfig> = {
       systemJobs: globalThis.Array.isArray(object?.systemJobs)
         ? object.systemJobs.map((e: any) => SystemJob.fromJSON(e))
         : globalThis.Array.isArray(object?.system_jobs)
-        ? object.system_jobs.map((e: any) => SystemJob.fromJSON(e))
-        : [],
+          ? object.system_jobs.map((e: any) => SystemJob.fromJSON(e))
+          : [],
     };
   },
 
@@ -2185,76 +2191,76 @@ export const RecordApiConfig: MessageFns<RecordApiConfig> = {
       tableName: isSet(object.tableName)
         ? globalThis.String(object.tableName)
         : isSet(object.table_name)
-        ? globalThis.String(object.table_name)
-        : undefined,
+          ? globalThis.String(object.table_name)
+          : undefined,
       attachedDatabases: globalThis.Array.isArray(object?.attachedDatabases)
         ? object.attachedDatabases.map((e: any) => globalThis.String(e))
         : globalThis.Array.isArray(object?.attached_databases)
-        ? object.attached_databases.map((e: any) => globalThis.String(e))
-        : [],
+          ? object.attached_databases.map((e: any) => globalThis.String(e))
+          : [],
       conflictResolution: isSet(object.conflictResolution)
         ? conflictResolutionStrategyFromJSON(object.conflictResolution)
         : isSet(object.conflict_resolution)
-        ? conflictResolutionStrategyFromJSON(object.conflict_resolution)
-        : undefined,
+          ? conflictResolutionStrategyFromJSON(object.conflict_resolution)
+          : undefined,
       autofillMissingUserIdColumns: isSet(object.autofillMissingUserIdColumns)
         ? globalThis.Boolean(object.autofillMissingUserIdColumns)
         : isSet(object.autofill_missing_user_id_columns)
-        ? globalThis.Boolean(object.autofill_missing_user_id_columns)
-        : undefined,
+          ? globalThis.Boolean(object.autofill_missing_user_id_columns)
+          : undefined,
       enableSubscriptions: isSet(object.enableSubscriptions)
         ? globalThis.Boolean(object.enableSubscriptions)
         : isSet(object.enable_subscriptions)
-        ? globalThis.Boolean(object.enable_subscriptions)
-        : undefined,
+          ? globalThis.Boolean(object.enable_subscriptions)
+          : undefined,
       aclWorld: globalThis.Array.isArray(object?.aclWorld)
         ? object.aclWorld.map((e: any) => permissionFlagFromJSON(e))
         : globalThis.Array.isArray(object?.acl_world)
-        ? object.acl_world.map((e: any) => permissionFlagFromJSON(e))
-        : [],
+          ? object.acl_world.map((e: any) => permissionFlagFromJSON(e))
+          : [],
       aclAuthenticated: globalThis.Array.isArray(object?.aclAuthenticated)
         ? object.aclAuthenticated.map((e: any) => permissionFlagFromJSON(e))
         : globalThis.Array.isArray(object?.acl_authenticated)
-        ? object.acl_authenticated.map((e: any) => permissionFlagFromJSON(e))
-        : [],
+          ? object.acl_authenticated.map((e: any) => permissionFlagFromJSON(e))
+          : [],
       excludedColumns: globalThis.Array.isArray(object?.excludedColumns)
         ? object.excludedColumns.map((e: any) => globalThis.String(e))
         : globalThis.Array.isArray(object?.excluded_columns)
-        ? object.excluded_columns.map((e: any) => globalThis.String(e))
-        : [],
+          ? object.excluded_columns.map((e: any) => globalThis.String(e))
+          : [],
       createAccessRule: isSet(object.createAccessRule)
         ? globalThis.String(object.createAccessRule)
         : isSet(object.create_access_rule)
-        ? globalThis.String(object.create_access_rule)
-        : undefined,
+          ? globalThis.String(object.create_access_rule)
+          : undefined,
       readAccessRule: isSet(object.readAccessRule)
         ? globalThis.String(object.readAccessRule)
         : isSet(object.read_access_rule)
-        ? globalThis.String(object.read_access_rule)
-        : undefined,
+          ? globalThis.String(object.read_access_rule)
+          : undefined,
       updateAccessRule: isSet(object.updateAccessRule)
         ? globalThis.String(object.updateAccessRule)
         : isSet(object.update_access_rule)
-        ? globalThis.String(object.update_access_rule)
-        : undefined,
+          ? globalThis.String(object.update_access_rule)
+          : undefined,
       deleteAccessRule: isSet(object.deleteAccessRule)
         ? globalThis.String(object.deleteAccessRule)
         : isSet(object.delete_access_rule)
-        ? globalThis.String(object.delete_access_rule)
-        : undefined,
+          ? globalThis.String(object.delete_access_rule)
+          : undefined,
       schemaAccessRule: isSet(object.schemaAccessRule)
         ? globalThis.String(object.schemaAccessRule)
         : isSet(object.schema_access_rule)
-        ? globalThis.String(object.schema_access_rule)
-        : undefined,
+          ? globalThis.String(object.schema_access_rule)
+          : undefined,
       expand: globalThis.Array.isArray(object?.expand)
         ? object.expand.map((e: any) => globalThis.String(e))
         : [],
       listingHardLimit: isSet(object.listingHardLimit)
         ? BigInt(object.listingHardLimit)
         : isSet(object.listing_hard_limit)
-        ? BigInt(object.listing_hard_limit)
-        : undefined,
+          ? BigInt(object.listing_hard_limit)
+          : undefined,
     };
   },
 
@@ -2592,8 +2598,8 @@ export const Config: MessageFns<Config> = {
       recordApis: globalThis.Array.isArray(object?.recordApis)
         ? object.recordApis.map((e: any) => RecordApiConfig.fromJSON(e))
         : globalThis.Array.isArray(object?.record_apis)
-        ? object.record_apis.map((e: any) => RecordApiConfig.fromJSON(e))
-        : [],
+          ? object.record_apis.map((e: any) => RecordApiConfig.fromJSON(e))
+          : [],
       schemas: globalThis.Array.isArray(object?.schemas)
         ? object.schemas.map((e: any) => JsonSchemaConfig.fromJSON(e))
         : [],
