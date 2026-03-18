@@ -53,11 +53,19 @@ impl WeChatOAuthProvider {
     let Some(client_id) = config.client_id.clone() else {
       return Err(OAuthProviderError::Missing("WeChat client id".to_string()));
     };
+    if client_id.trim().is_empty() {
+      return Err(OAuthProviderError::Missing("WeChat client id".to_string()));
+    }
     let Some(client_secret) = config.client_secret.clone() else {
       return Err(OAuthProviderError::Missing(
         "WeChat client secret".to_string(),
       ));
     };
+    if client_secret.trim().is_empty() {
+      return Err(OAuthProviderError::Missing(
+        "WeChat client secret".to_string(),
+      ));
+    }
 
     Ok(Self {
       client_id,
@@ -346,5 +354,30 @@ mod tests {
     );
     assert!(query.get("client_id").is_none());
     assert_eq!(authorize_url.fragment(), Some("wechat_redirect"));
+  }
+
+  #[test]
+  fn wechat_new_rejects_blank_client_id_or_secret() {
+    let missing_client_id = WeChatOAuthProvider::new(&OAuthProviderConfig {
+      client_id: Some("   ".to_string()),
+      client_secret: Some("wechat-secret".to_string()),
+      provider_id: Some(OAuthProviderId::Wechat as i32),
+      ..Default::default()
+    });
+    assert!(matches!(
+      missing_client_id,
+      Err(OAuthProviderError::Missing(message)) if message == "WeChat client id"
+    ));
+
+    let missing_client_secret = WeChatOAuthProvider::new(&OAuthProviderConfig {
+      client_id: Some("wechat-app-id".to_string()),
+      client_secret: Some("".to_string()),
+      provider_id: Some(OAuthProviderId::Wechat as i32),
+      ..Default::default()
+    });
+    assert!(matches!(
+      missing_client_secret,
+      Err(OAuthProviderError::Missing(message)) if message == "WeChat client secret"
+    ));
   }
 }
