@@ -3,13 +3,16 @@ use base64::Engine as _;
 use lazy_static::lazy_static;
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::app_state::AppState;
 use crate::auth::AuthError;
 use crate::auth::oauth::provider::{TokenResponse, build_oauth_http_client};
 use crate::auth::oauth::providers::{OAuthProviderError, OAuthProviderFactory};
-use crate::auth::oauth::{OAuthClientSettings, OAuthProvider, OAuthUser, WECHAT_SYNTHETIC_EMAIL_DOMAIN};
+use crate::auth::oauth::{
+  OAuthClientSettings, OAuthProvider, OAuthUser, WECHAT_SYNTHETIC_EMAIL_DOMAIN,
+};
 use crate::config::proto::{OAuthProviderConfig, OAuthProviderId};
 use crate::constants::AUTH_API_PATH;
 
@@ -30,6 +33,12 @@ struct WeChatUser {
   openid: String,
   headimgurl: Option<String>,
   unionid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeChatErrorResponse {
+  errcode: Option<i64>,
+  errmsg: Option<String>,
 }
 
 impl WeChatOAuthProvider {
@@ -72,21 +81,31 @@ impl WeChatOAuthProvider {
     format!("{encoded}@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
   }
 
-  async fn exchange_code(
-    &self,
-    state: &AppState,
-    auth_code: String,
-  ) -> Result<WeChatTokenResponse, AuthError> {
-    let Some(ref site_url) = *state.site_url() else {
-      return Err(AuthError::Internal(
-        "Missing site_url for redirect back from external provider to your TB instance".into(),
-      ));
-    };
-
-    let _redirect_url = site_url
-      .join(&format!("/{AUTH_API_PATH}/oauth/{}/callback", Self::NAME))
+  fn parse_wechat_response<T: DeserializeOwned>(
+    payload: serde_json::Value,
+    operation: &str,
+  ) -> Result<T, AuthError> {
+    let error = serde_json::from_value::<WeChatErrorResponse>(payload.clone())
       .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
+    if error.errcode.is_some() || error.errmsg.is_some() {
+      let errcode = error.errcode.unwrap_or_default();
+      let errmsg = error
+        .errmsg
+        .unwrap_or_else(|| "unknown WeChat error".to_string());
+      return Err(AuthError::FailedDependency(
+        format!("WeChat {operation} failed ({errcode}): {errmsg}").into(),
+      ));
+    }
+
+    serde_json::from_value(payload).map_err(|err| AuthError::FailedDependency(err.into()))
+  }
+
+  async fn exchange_code(
+    &self,
+    _state: &AppState,
+    auth_code: String,
+  ) -> Result<WeChatTokenResponse, AuthError> {
     let mut token_url = Url::parse(Self::TOKEN_URL).expect("infallible");
     token_url.query_pairs_mut().extend_pairs([
       ("appid", self.client_id.as_str()),
@@ -101,10 +120,12 @@ impl WeChatOAuthProvider {
       .await
       .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
-    response
-      .json::<WeChatTokenResponse>()
+    let payload = response
+      .json::<serde_json::Value>()
       .await
-      .map_err(|err| AuthError::FailedDependency(err.into()))
+      .map_err(|err| AuthError::FailedDependency(err.into()))?;
+
+    Self::parse_wechat_response(payload, "token exchange")
   }
 }
 
@@ -193,10 +214,12 @@ impl OAuthProvider for WeChatOAuthProvider {
       .await
       .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
-    let user = response
-      .json::<WeChatUser>()
+    let payload = response
+      .json::<serde_json::Value>()
       .await
       .map_err(|err| AuthError::FailedDependency(err.into()))?;
+
+    let user = Self::parse_wechat_response::<WeChatUser>(payload, "userinfo fetch")?;
 
     let provider_user_id = user
       .unionid
@@ -225,6 +248,7 @@ mod tests {
   use std::collections::HashMap;
 
   use oauth2::PkceCodeChallenge;
+  use serde_json::json;
 
   use crate::app_state::{TestStateOptions, test_state};
   use crate::auth::oauth::OAuthProvider;
@@ -249,6 +273,38 @@ mod tests {
 
     assert!(!provider.use_pkce());
     assert_eq!(provider.oauth_scopes(), vec!["snsapi_login"]);
+  }
+
+  #[test]
+  fn parse_wechat_response_rejects_error_payload() {
+    let err = WeChatOAuthProvider::parse_wechat_response::<WeChatTokenResponse>(
+      json!({"errcode": 40029, "errmsg": "invalid code"}),
+      "token exchange",
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, AuthError::FailedDependency(_)));
+    assert_eq!(
+      err.to_string(),
+      "Failed dependency: WeChat token exchange failed (40029): invalid code"
+    );
+  }
+
+  #[test]
+  fn parse_wechat_response_accepts_success_payload() {
+    let token = WeChatOAuthProvider::parse_wechat_response::<WeChatTokenResponse>(
+      json!({
+        "access_token": "token",
+        "openid": "openid",
+        "unionid": "unionid"
+      }),
+      "token exchange",
+    )
+    .unwrap();
+
+    assert_eq!(token.access_token, "token");
+    assert_eq!(token.openid, "openid");
+    assert_eq!(token.unionid.as_deref(), Some("unionid"));
   }
 
   #[tokio::test]

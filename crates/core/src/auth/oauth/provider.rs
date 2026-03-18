@@ -7,6 +7,7 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use url::Url;
 
 use crate::app_state::AppState;
@@ -64,6 +65,8 @@ pub struct OAuthClientSettings {
 
 pub(crate) fn build_oauth_http_client() -> Result<reqwest::Client, AuthError> {
   reqwest::ClientBuilder::new()
+    .timeout(Duration::from_secs(10))
+    .connect_timeout(Duration::from_secs(5))
     .redirect(reqwest::redirect::Policy::none())
     .build()
     .map_err(|err| AuthError::Internal(err.into()))
