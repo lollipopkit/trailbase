@@ -4,6 +4,7 @@ use lazy_static::lazy_static;
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::app_state::AppState;
@@ -85,7 +86,8 @@ impl WeChatOAuthProvider {
   }
 
   fn synthetic_email(provider_user_id: &str) -> String {
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(provider_user_id);
+    let digest = Sha256::digest(provider_user_id.as_bytes());
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
     format!("{encoded}@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
   }
 
@@ -96,8 +98,7 @@ impl WeChatOAuthProvider {
     let error = serde_json::from_value::<WeChatErrorResponse>(payload.clone())
       .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
-    if error.errcode.is_some() || error.errmsg.is_some() {
-      let errcode = error.errcode.unwrap_or_default();
+    if let Some(errcode) = error.errcode.filter(|errcode| *errcode != 0) {
       let errmsg = error
         .errmsg
         .unwrap_or_else(|| "unknown WeChat error".to_string());
@@ -269,7 +270,7 @@ mod tests {
 
     assert_eq!(
       email,
-      format!("dW5pb25pZC0xMjM@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
+      format!("wGQ-3wZlLNM28adkxnscsH9NFD8TrmTb92VbALfbU84@{WECHAT_SYNTHETIC_EMAIL_DOMAIN}")
     );
   }
 
@@ -306,6 +307,24 @@ mod tests {
         "access_token": "token",
         "openid": "openid",
         "unionid": "unionid"
+      }),
+      "token exchange",
+    )
+    .unwrap();
+
+    assert_eq!(token.access_token, "token");
+    assert_eq!(token.openid, "openid");
+    assert_eq!(token.unionid.as_deref(), Some("unionid"));
+  }
+
+  #[test]
+  fn parse_wechat_response_accepts_success_with_errcode_zero() {
+    let token = WeChatOAuthProvider::parse_wechat_response::<WeChatTokenResponse>(
+      json!({
+        "access_token": "token",
+        "openid": "openid",
+        "unionid": "unionid",
+        "errcode": 0
       }),
       "token exchange",
     )
