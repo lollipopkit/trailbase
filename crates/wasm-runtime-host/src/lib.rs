@@ -13,19 +13,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
-// use tokio::sync::Mutex;
 use tokio::task::JoinError;
 use trailbase_wasi_keyvalue::WasiKeyValueCtx;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{AsContextMut, Config, Engine, Result, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
-use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::WasiHttpView;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
-use host::exports::trailbase::component::init_endpoint::Arguments;
+use crate::host::TransactionImpl;
+use crate::host::exports::trailbase::component::init_endpoint::Arguments;
 
-pub use host::exports::trailbase::component::init_endpoint::HttpMethodType;
-pub use host::{SharedState, State};
+pub use crate::host::exports::trailbase::component::init_endpoint::HttpMethodType;
+pub use crate::host::{SharedState, State};
 pub use trailbase_wasi_keyvalue::Store as KvStore;
 
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -124,7 +125,7 @@ impl<T: StoreBuilder<State>> RuntimeT<T> {
       wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
       // Adds default HTTP interfaces - incoming and outgoing.
-      wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+      wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
       // Add default KV interfaces.
       trailbase_wasi_keyvalue::add_to_linker(&mut linker, |cx| {
@@ -216,10 +217,14 @@ impl StoreBuilder<State> for Arc<SharedState> {
       State {
         resource_table: ResourceTable::new(),
         wasi_ctx: wasi_ctx.build(),
-        http: WasiHttpCtx::new(),
+        http_ctx: WasiHttpCtx::new(),
+        hooks: host::Hooks {
+          shared: self.clone(),
+        },
         kv: WasiKeyValueCtx::new(self.kv_store.clone()),
+        #[allow(deprecated)]
+        tx: tokio::sync::Mutex::new(TransactionImpl::default()),
         shared: self.clone(),
-        tx: Arc::new(parking_lot::Mutex::new(None)),
       },
     ));
   }
@@ -274,11 +279,9 @@ impl HttpStore {
       // let mut store = state.store.lock().await;
       store
         .run_concurrent(async |accessor| -> Result<InitResult, Error> {
-          let (http, task_exit) = api.call_init_http_handlers(accessor, args.clone()).await?;
-          task_exit.block(accessor).await;
+          let http = api.call_init_http_handlers(accessor, args.clone()).await?;
 
-          let (job, task_exit) = api.call_init_job_handlers(accessor, args).await?;
-          task_exit.block(accessor).await;
+          let job = api.call_init_job_handlers(accessor, args).await?;
 
           return Ok(InitResult {
             http_handlers: http.handlers,
@@ -294,12 +297,12 @@ impl HttpStore {
   pub async fn call_incoming_http_handler(
     &self,
     request: hyper::Request<UnsyncBoxBody<Bytes, hyper::Error>>,
-  ) -> Result<hyper::Response<wasmtime_wasi_http::body::HyperOutgoingBody>, Error> {
+  ) -> Result<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>, Error> {
     let state = self.state.clone();
 
     return Self::call(&self.state.runtime_state, async move {
       let (sender, receiver) = tokio::sync::oneshot::channel::<
-        Result<hyper::Response<wasmtime_wasi_http::body::HyperOutgoingBody>, ErrorCode>,
+        Result<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>, ErrorCode>,
       >();
 
       // NOTE: wstd streams out responses in chunks of 2kB. Only once everything has been
@@ -323,7 +326,7 @@ impl HttpStore {
           .new_store(&state.rt.state.engine)?;
         // let (mut lock, _bindings) = state.rt.new_bindings().await?;
 
-        let proxy_bindings = wasmtime_wasi_http::bindings::Proxy::instantiate_async(
+        let proxy_bindings = wasmtime_wasi_http::p2::bindings::Proxy::instantiate_async(
           &mut lock,
           &state.rt.state.component,
           &state.rt.state.linker,
@@ -331,12 +334,12 @@ impl HttpStore {
         .await?;
         // let mut lock = state.store.lock().await;
 
-        let req = lock.data_mut().new_incoming_request(
-          wasmtime_wasi_http::bindings::http::types::Scheme::Http,
+        let req = lock.data_mut().http().new_incoming_request(
+          wasmtime_wasi_http::p2::bindings::http::types::Scheme::Http,
           request,
         )?;
 
-        let out = lock.data_mut().new_response_outparam(sender)?;
+        let out = lock.data_mut().http().new_response_outparam(sender)?;
 
         // FIXME: Using the shared store, this may not trigger the execution of JS guests.
         // Rust guests don't have the same issue. Yet unclear what exactly is happening. Some
@@ -422,14 +425,13 @@ pub fn find_wasm_components(components_path: impl AsRef<std::path::Path>) -> Vec
         return None;
       };
 
-      if !metadata.is_file() {
-        return None;
+      if metadata.is_file() || metadata.is_symlink() {
+        let path = entry.path();
+        if path.extension()? == "wasm" {
+          return Some(path);
+        }
       }
 
-      let path = entry.path();
-      if path.extension()? == "wasm" {
-        return Some(path);
-      }
       return None;
     })
     .collect();
@@ -550,7 +552,7 @@ mod tests {
     assert_eq!(
       1,
       conn
-        .query_row_f("SELECT COUNT(*) FROM tx;", (), |row| row.get::<_, i64>(0))
+        .read_query_row_get::<i64>("SELECT COUNT(*) FROM tx;", (), 0)
         .await
         .unwrap()
         .unwrap()
@@ -583,10 +585,26 @@ mod tests {
 
   #[tokio::test]
   async fn test_custom_sqlite_function() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let _sqlite_function_runtime = init_sqlite_function_runtime(&conn).await;
+    let conn = parking_lot::Mutex::new(rusqlite::Connection::open_in_memory().ok());
 
-    let conn = trailbase_sqlite::Connection::from_connection_test_only(conn);
+    let _sqlite_function_runtime = {
+      let lock = conn.lock();
+      init_sqlite_function_runtime(lock.as_ref().unwrap()).await
+    };
+
+    let conn = trailbase_sqlite::Connection::with_opts(
+      move || -> Result<_, rusqlite::Error> {
+        // Consume the rusqlite connection, only works for one thread.
+        let mut lock = conn.lock();
+        return Ok(lock.take().unwrap());
+      },
+      trailbase_sqlite::Options {
+        num_threads: Some(1),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
     let runtime = init_runtime(Some(conn.clone()));
 
     {
@@ -647,8 +665,9 @@ mod tests {
   }
 
   async fn response_to_i64(resp: Response<UnsyncBoxBody<Bytes, ErrorCode>>) -> i64 {
-    assert_eq!(resp.status(), StatusCode::OK, "{resp:?}");
-    let body: Bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let (head, body) = resp.into_parts();
+    let body: Bytes = body.collect().await.unwrap().to_bytes();
+    assert_eq!(head.status, StatusCode::OK, "{body:?}");
     return String::from_utf8_lossy(&body).trim().parse().unwrap();
   }
 }

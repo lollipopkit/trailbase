@@ -8,7 +8,7 @@ use crate::admin::AdminError as Error;
 use crate::app_state::AppState;
 use crate::config::proto::hash_config;
 use crate::constants::SQLITE_SCHEMA_TABLE;
-use crate::transaction::TransactionRecorder;
+use crate::transaction_recorder::TransactionRecorder;
 
 #[derive(Clone, Debug, Deserialize, TS)]
 #[ts(export)]
@@ -69,15 +69,15 @@ pub async fn drop_table_handler(
     let unqualified_table_name = unqualified_table_name.clone();
     let entity_type = entity_type.clone();
     conn
-      .call(move |conn| {
-        let mut tx = TransactionRecorder::new(conn)?;
+      .transaction(move |tx| {
+        let mut tx = TransactionRecorder::new(tx);
 
         let query = format!(
           "DROP {entity_type} IF EXISTS {}",
           unqualified_table_name.escaped_string()
         );
         debug!("dropping table: {query}");
-        tx.execute(&query, ())?;
+        tx.execute(query, ())?;
 
         return tx
           .rollback()
@@ -97,7 +97,7 @@ pub async fn drop_table_handler(
 
     // Fix configuration: remove all APIs reference the no longer existing table.
     {
-      let mut config = state.get_config();
+      let mut config = (*state.get_config()).clone();
       let old_config_hash = hash_config(&config);
 
       config.record_apis.retain(|c| {

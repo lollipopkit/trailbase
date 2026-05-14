@@ -2,7 +2,7 @@
 #![allow(clippy::needless_return)]
 #![warn(
   clippy::await_holding_lock,
-  clippy::empty_enum,
+  clippy::empty_enums,
   clippy::enum_glob_use,
   clippy::inefficient_to_string,
   clippy::mem_forget,
@@ -10,14 +10,70 @@
   clippy::needless_continue
 )]
 
-pub mod connection;
-pub mod error;
-pub mod params;
-pub mod rows;
+mod database;
+mod error;
+pub mod from_sql;
+mod params;
+mod rows;
+pub mod sqlite;
+mod statement;
+pub mod to_sql;
+pub mod traits;
+mod r#type;
+mod value;
 
-pub use rusqlite::types::Value;
+#[cfg(feature = "pg")]
+mod pg;
 
-pub use connection::Connection;
-pub use error::Error;
+#[cfg(feature = "generic")]
+pub mod generic;
+
+#[cfg(not(feature = "generic"))]
+mod connection_imports {
+  pub use super::sqlite::batch::execute_batch;
+  pub use super::sqlite::connection::{ArcLockGuard, Connection, LockError, LockGuard, Options};
+  pub use super::sqlite::sync::SyncConnection;
+  pub use super::sqlite::transaction::Transaction;
+  pub use super::r#type::ConnectionType;
+}
+
+#[cfg(feature = "generic")]
+mod connection_imports {
+  pub use super::generic::{Connection, SyncConnection, Transaction, execute_batch};
+  pub use super::sqlite::connection::{ArcLockGuard, LockError, LockGuard, Options};
+  pub use super::r#type::ConnectionType;
+}
+
+pub use connection_imports::*;
+
+pub use database::Database;
+pub use error::{Error, unpack_other_error};
 pub use params::{NamedParamRef, NamedParams, NamedParamsRef, Params};
 pub use rows::{Row, Rows, ValueType};
+pub use statement::Statement;
+pub use traits::SyncConnection as SyncConnectionTrait;
+pub use value::{Value, ValueRef};
+
+#[macro_export]
+macro_rules! params {
+    () => {
+        [] as [$crate::to_sql::ToSqlProxy]
+    };
+    ($($param:expr),+ $(,)?) => {
+        [$(Into::<$crate::to_sql::ToSqlProxy>::into($param)),+]
+    };
+}
+
+#[macro_export]
+macro_rules! named_params {
+    () => {
+        [] as [(&str, $crate::to_sql::ToSqlProxy)]
+    };
+    ($($param_name:literal: $param_val:expr),+ $(,)?) => {
+        [$(($param_name as &str, Into::<$crate::to_sql::ToSqlProxy>::into($param_val))),+]
+    };
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

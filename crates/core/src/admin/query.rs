@@ -8,6 +8,7 @@ use ts_rs::TS;
 use crate::AppState;
 use crate::admin::AdminError as Error;
 use crate::admin::util::{rows_to_columns, rows_to_sql_value_rows};
+use crate::connection::{BuildOptions, ConnectionEntry};
 
 #[derive(Debug, Default, Serialize, TS)]
 #[ts(export)]
@@ -69,15 +70,19 @@ pub async fn query_handler(
   }
 
   // Initialize a new connection, to avoid any sort of tomfoolery like dropping attached databases.
-  let conn = state.connection_manager().build(
-    true,
-    request
-      .attached_databases
-      .map(|v| v.into_iter().collect())
-      .as_ref(),
-  )?;
+  // NOTE: This is relatively expensive, thus limit the number of spawned threads to 1.
+  let ConnectionEntry {
+    connection: conn, ..
+  } = state
+    .connection_manager()
+    .build(BuildOptions {
+      is_main: true,
+      attached_databases: request.attached_databases.map(|v| v.into_iter().collect()),
+      num_threads: Some(1),
+    })
+    .await?;
 
-  let batched_rows_result = conn.execute_batch(request.query).await;
+  let batched_rows_result = trailbase_sqlite::execute_batch(&conn, request.query).await;
 
   // In the fallback case we always need to invalidate the cache.
   if must_invalidate_schema_cache {
@@ -91,5 +96,6 @@ pub async fn query_handler(
       rows: rows_to_sql_value_rows(&rows)?,
     }));
   }
+
   return Ok(Json(QueryResponse::default()));
 }

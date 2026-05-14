@@ -2,6 +2,7 @@ use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use axum_test::multipart::MultipartForm;
+use serde::Deserialize;
 use std::sync::Arc;
 use tower_cookies::Cookie;
 use trailbase_sqlite::params;
@@ -17,7 +18,7 @@ async fn add_record_api_config(
   state: &AppState,
   api: RecordApiConfig,
 ) -> Result<(), anyhow::Error> {
-  let mut config = state.get_config();
+  let mut config = (*state.get_config()).clone();
   config.record_apis.push(api);
   return Ok(state.validate_and_update_config(config, None).await?);
 }
@@ -236,30 +237,36 @@ async fn test_record_apis() {
     }
   }
 
+  tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
   let logs_count: i64 = logs_conn
-    .read_query_row_f("SELECT COUNT(*) FROM _logs", (), |row| row.get(0))
+    .read_query_row_get("SELECT COUNT(*) FROM _logs", (), 0)
     .await
     .unwrap()
     .unwrap();
   assert!(logs_count > 0);
 
-  let (fetched_ip, latency, status): (String, f64, i64) = logs_conn
-    .read_query_row_f(
+  #[derive(Deserialize)]
+  struct Log {
+    client_ip: String,
+    latency: f64,
+    status: i64,
+  }
+
+  let got: Log = logs_conn
+    .read_query_value(
       "SELECT client_ip, latency, status FROM _logs WHERE client_ip = $1",
       trailbase_sqlite::params!(client_ip),
-      |row| -> Result<_, rusqlite::Error> {
-        return Ok((row.get(0)?, row.get(1)?, row.get(2)?));
-      },
     )
     .await
     .unwrap()
     .unwrap();
 
-  // We're also testing stiching here, since client_ip is recorded on_request and latency/status
+  // We're also testing stitching here, since client_ip is recorded on_request and latency/status
   // on_response.
-  assert_eq!(fetched_ip, client_ip);
-  assert!(latency > 0.0);
-  assert_eq!(status, 200);
+  assert_eq!(got.client_ip, client_ip);
+  assert!(got.latency > 0.0);
+  assert_eq!(got.status, 200);
 }
 
 async fn create_chat_message_app_tables(
@@ -305,10 +312,10 @@ async fn add_room(
   name: &str,
 ) -> Result<[u8; 16], anyhow::Error> {
   let room: [u8; 16] = conn
-    .query_row_f(
+    .write_query_row_get(
       "INSERT INTO room (name) VALUES ($1) RETURNING id",
       params!(name.to_string()),
-      |row| row.get::<_, [u8; 16]>(0),
+      0,
     )
     .await?
     .unwrap();

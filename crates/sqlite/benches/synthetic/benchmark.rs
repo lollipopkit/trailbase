@@ -7,11 +7,10 @@ use criterion::{Bencher, Criterion, Throughput, criterion_group, criterion_main}
 use log::*;
 use parking_lot::Mutex;
 use rand::RngExt;
-use rusqlite::types::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trailbase_sqlite::connection::{Connection, Options};
+use trailbase_sqlite::{Connection, Options, Value};
 
 use crate::connection::{AsyncConnection, SharedRusqlite, ThreadLocalRusqlite};
 use crate::error::BenchmarkError;
@@ -118,45 +117,48 @@ fn insert_benchmark_group(c: &mut Criterion) {
 
   group.bench_function("trailbase-sqlite (1 thread)", |b| {
     async_insert_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        None,
+        Options {
+          num_threads: Some(1),
+          ..Default::default()
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (2 threads)", |b| {
     async_insert_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 2,
+        Options {
+          num_threads: Some(2),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (4 threads)", |b| {
     async_insert_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 4,
+        Options {
+          num_threads: Some(4),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (8 threads)", |b| {
     async_insert_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 8,
+        Options {
+          num_threads: Some(8),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
@@ -253,45 +255,48 @@ fn read_benchmark_group(c: &mut Criterion) {
 
   group.bench_function("trailbase-sqlite (1 thread)", |b| {
     async_read_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        None,
+        Options {
+          num_threads: Some(1),
+          ..Default::default()
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (2 threads)", |b| {
     async_read_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 2,
+        Options {
+          num_threads: Some(2),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (4 threads)", |b| {
     async_read_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 4,
+        Options {
+          num_threads: Some(4),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
 
   group.bench_function("trailbase-sqlite (8 threads)", |b| {
     async_read_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 8,
+        Options {
+          num_threads: Some(8),
           ..Default::default()
-        }),
+        },
       )?);
     })
   });
@@ -426,45 +431,48 @@ fn mixed_benchmark_group(c: &mut Criterion) {
 
   group.bench_function("trailbase-sqlite (1 thread)", |b| {
     async_mixed_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        None,
+        Options {
+          num_threads: Some(1),
+          ..Default::default()
+        },
       )?);
     });
   });
 
   group.bench_function("trailbase-sqlite (2 threads)", |b| {
     async_mixed_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 2,
+        Options {
+          num_threads: Some(2),
           ..Default::default()
-        }),
+        },
       )?);
     });
   });
 
   group.bench_function("trailbase-sqlite (4 threads)", |b| {
     async_mixed_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 4,
+        Options {
+          num_threads: Some(4),
           ..Default::default()
-        }),
+        },
       )?);
     });
   });
 
   group.bench_function("trailbase-sqlite (8 threads)", |b| {
     async_mixed_benchmark(b, async |fname| {
-      return Ok(Connection::new(
+      return Ok(Connection::with_opts(
         || rusqlite::Connection::open(&fname),
-        Some(Options {
-          n_read_threads: 8,
+        Options {
+          num_threads: Some(8),
           ..Default::default()
-        }),
+        },
       )?);
     });
   });

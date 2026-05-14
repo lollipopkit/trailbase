@@ -1,15 +1,17 @@
-use rusqlite::ffi;
+use futures_util::future::join_all;
 use rusqlite::hooks::PreUpdateCase;
+use rusqlite::{ErrorCode, ffi};
 use serde::Deserialize;
 use std::borrow::Cow;
 
-use crate::connection::{Connection, Database, Error, Options, extract_row_id};
-use crate::{Value, ValueType};
-use rusqlite::ErrorCode;
+use crate::sqlite::connection::{Connection, Options};
+use crate::sqlite::extract_row_id;
+use crate::{Database, Error, SyncConnectionTrait, Value, ValueType};
 
 #[tokio::test]
 async fn open_in_memory_test() {
   let conn = Connection::open_in_memory().unwrap();
+  assert_eq!(1, conn.threads());
   assert!(conn.close().await.is_ok());
 }
 
@@ -18,13 +20,11 @@ async fn call_success_test() {
   let conn = Connection::open_in_memory().unwrap();
 
   let result = conn
-    .call(|conn| {
-      conn
-        .execute(
-          "CREATE TABLE person(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);",
-          [],
-        )
-        .map_err(|e| e.into())
+    .call_writer(|mut conn| {
+      return conn.execute(
+        "CREATE TABLE person(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);",
+        (),
+      );
     })
     .await;
 
@@ -36,7 +36,7 @@ async fn call_failure_test() {
   let conn = Connection::open_in_memory().unwrap();
 
   let result = conn
-    .call(|conn| conn.execute("Invalid sql", []).map_err(|e| e.into()))
+    .call_writer(|mut conn| conn.execute("Invalid sql", ()))
     .await;
 
   assert!(match result.unwrap_err() {
@@ -58,16 +58,18 @@ async fn call_failure_test() {
 #[tokio::test]
 async fn close_success_test() {
   let tmp_dir = tempfile::TempDir::new().unwrap();
-  let fname = tmp_dir.path().join("main.sqlite");
+  let db_path = tmp_dir.path().join("main.sqlite");
 
-  let conn = Connection::new(
-    move || rusqlite::Connection::open(&fname),
-    Some(Options {
-      n_read_threads: 2,
+  let conn = Connection::with_opts(
+    move || rusqlite::Connection::open(&db_path),
+    Options {
+      num_threads: Some(3),
       ..Default::default()
-    }),
+    },
   )
   .unwrap();
+
+  assert_eq!(3, conn.threads());
 
   conn
     .execute("CREATE TABLE 'test' (id INTEGER PRIMARY KEY)", ())
@@ -112,7 +114,7 @@ async fn close_call_test() {
   assert!(conn.close().await.is_ok());
 
   let result = conn2
-    .call(|conn| conn.execute("SELECT 1;", []).map_err(|e| e.into()))
+    .call_writer(|mut conn| conn.execute("SELECT 1;", ()))
     .await;
 
   assert!(matches!(
@@ -126,24 +128,24 @@ async fn close_failure_test() {
   let conn = Connection::open_in_memory().unwrap();
 
   conn
-    .call(|conn| {
-      conn
-        .execute(
-          "CREATE TABLE person(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);",
-          [],
-        )
-        .map_err(|e| e.into())
+    .call_writer(|mut conn| {
+      return conn.execute(
+        "CREATE TABLE person(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);",
+        (),
+      );
     })
     .await
     .unwrap();
 
   conn
-    .call(|conn| {
+    .exec
+    .call_writer(|conn| {
       // Leak a prepared statement to make the database uncloseable
       // See https://www.sqlite.org/c3ref/close.html for details regarding this behaviour
       let stmt = Box::new(conn.prepare("INSERT INTO person VALUES (1, ?1);").unwrap());
       Box::leak(stmt);
-      Ok(())
+
+      return Ok::<_, rusqlite::Error>(());
     })
     .await
     .unwrap();
@@ -151,7 +153,7 @@ async fn close_failure_test() {
   let err = conn.close().await.unwrap_err();
   assert!(
     match &err {
-      crate::Error::Close(e) => {
+      crate::Error::Rusqlite(e) => {
         *e == rusqlite::Error::SqliteFailure(
           ffi::Error {
             code: ErrorCode::DatabaseBusy,
@@ -193,7 +195,8 @@ async fn test_ergonomic_errors() {
   let conn = Connection::open_in_memory().unwrap();
 
   let res = conn
-    .call(|conn| failable_func(conn).map_err(|e| Error::Other(Box::new(e))))
+    .exec
+    .call_writer(|conn| failable_func(conn).map_err(|e| Error::Other(Box::new(e))))
     .await
     .unwrap_err();
 
@@ -209,13 +212,11 @@ async fn test_execute_and_query() {
   let conn = Connection::open_in_memory().unwrap();
 
   let result = conn
-    .call(|conn| {
-      conn
-        .execute(
-          "CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-          [],
-        )
-        .map_err(|e| e.into())
+    .call_writer(|mut conn| {
+      return conn.execute(
+        "CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        (),
+      );
     })
     .await;
 
@@ -253,7 +254,7 @@ async fn test_execute_and_query() {
     .unwrap();
 
   let row = conn
-    .read_query_row("SELECT name FROM person WHERE id = $1", &[1])
+    .read_query_row("SELECT name FROM person WHERE id = $1", (1,))
     .await
     .unwrap()
     .unwrap();
@@ -267,26 +268,35 @@ async fn test_execute_and_query() {
   }
 
   let person = conn
-    .read_query_value::<Person>("SELECT * FROM person WHERE id = $1", &[1])
+    .read_query_value::<Person>("SELECT * FROM person WHERE id = $1", (1,))
     .await
     .unwrap()
     .unwrap();
   assert_eq!(person.id, 1);
   assert_eq!(person.name, "baz");
 
-  let rows = conn
-    .execute_batch(
-      r#"
+  let rows = crate::sqlite::execute_batch(
+    &conn,
+    r#"
         CREATE TABLE foo (id INTEGER) STRICT;
         INSERT INTO foo (id) VALUES (17);
         SELECT * FROM foo;
       "#,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+  )
+  .await
+  .unwrap()
+  .unwrap();
   assert_eq!(rows.len(), 1);
-  assert_eq!(rows.0.get(0).unwrap().get::<i64>(0), Ok(17));
+  assert_eq!(rows.0.get(0).unwrap().get::<i64>(0).unwrap(), 17);
+
+  // Lastly make sure rusqlite and out Connection consistently execute batches
+  // containing statements returning rows.
+  let query = "
+    SELECT * FROM foo;
+    SELECT * FROM foo;
+  ";
+  conn.write_lock().unwrap().execute_batch(query).unwrap();
+  conn.execute_batch(query).await.unwrap();
 }
 
 #[tokio::test]
@@ -315,9 +325,7 @@ async fn test_execute_batch() {
 
   let count = async |table: &str| -> i64 {
     return conn
-      .query_row_f(format!("SELECT COUNT(*) FROM {table}"), (), |row| {
-        row.get(0)
-      })
+      .write_query_row_get(format!("SELECT COUNT(*) FROM {table}"), (), 0)
       .await
       .unwrap()
       .unwrap();
@@ -361,9 +369,9 @@ async fn test_identity() {
 #[test]
 fn test_locking() {
   let conn = Connection::open_in_memory().unwrap();
-  let mut lock = conn.write_lock();
+  let mut lock = conn.write_lock().unwrap();
 
-  let tx = lock.transaction().unwrap();
+  let mut tx = lock.transaction().unwrap();
   tx.execute_batch(
     r#"
       CREATE TABLE 'table' (id INTEGER PRIMARY KEY, name TEXT);
@@ -391,13 +399,11 @@ async fn test_params() {
   let conn = Connection::open_in_memory().unwrap();
 
   conn
-    .call(|conn| {
-      conn
-        .execute(
-          "CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-          [],
-        )
-        .map_err(|e| e.into())
+    .call_writer(|mut conn| {
+      return conn.execute(
+        "CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        (),
+      );
     })
     .await
     .unwrap();
@@ -442,7 +448,7 @@ async fn test_params() {
     .unwrap();
 
   let count: i64 = conn
-    .read_query_row_f("SELECT COUNT(*) FROM person", (), |row| row.get(0))
+    .read_query_row_get("SELECT COUNT(*) FROM person", (), 0)
     .await
     .unwrap()
     .unwrap();
@@ -465,44 +471,49 @@ async fn test_hooks() {
     row_id: i64,
   }
 
-  let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
-  let c = conn.clone();
+  let (sender, receiver) = flume::unbounded::<String>();
 
   conn
     .write_lock()
-    .preupdate_hook(Some(
-      move |action: rusqlite::hooks::Action, _db: &str, table_name: &str, case: &PreUpdateCase| {
-        let row_id = extract_row_id(case).unwrap();
-        let state = State {
-          action,
-          table_name: table_name.to_string(),
-          row_id,
-        };
-
-        let sender = sender.clone();
-        c.call_and_forget(move |conn| {
-          match state.action {
-            rusqlite::hooks::Action::SQLITE_INSERT => {
-              let text = conn
-                .query_row(
-                  &format!(
-                    r#"SELECT text FROM "{}" WHERE _rowid_ = $1"#,
-                    state.table_name
-                  ),
-                  [state.row_id],
-                  |row| row.get::<_, String>(0),
-                )
-                .unwrap();
-
-              sender.send(text).unwrap();
-            }
-            _ => {
-              panic!("unexpected action: {:?}", state.action);
-            }
+    .unwrap()
+    .preupdate_hook({
+      let conn = conn.clone();
+      Some(
+        move |action: rusqlite::hooks::Action,
+              _db: &str,
+              table_name: &str,
+              case: &PreUpdateCase| {
+          let row_id = extract_row_id(case).unwrap();
+          let state = State {
+            action,
+            table_name: table_name.to_string(),
+            row_id,
           };
-        });
-      },
-    ))
+
+          if state.action != rusqlite::hooks::Action::SQLITE_INSERT {
+            panic!("unexpected action: {:?}", state.action);
+          }
+
+          let sender = sender.clone();
+          let conn = conn.clone();
+
+          // We can't lock here since the lock is held by the `execute` below triggering
+          // the hook. Thus delay the query until after the `execute` completes.
+          std::thread::spawn(move || {
+            let query = format!("SELECT text FROM '{}' WHERE _rowid_ = $1", state.table_name);
+            sender
+              .send(
+                conn
+                  .write_lock()
+                  .unwrap()
+                  .query_row(&query, (state.row_id,), |row| row.get(0))
+                  .unwrap(),
+              )
+              .unwrap();
+          });
+        },
+      )
+    })
     .unwrap();
 
   conn
@@ -510,7 +521,7 @@ async fn test_hooks() {
     .await
     .unwrap();
 
-  let text = receiver.recv().await.unwrap();
+  let text = receiver.recv().unwrap();
   assert_eq!(text, "foo");
 }
 
@@ -525,15 +536,126 @@ enum MyError {
 async fn test_attach() {
   let conn = Connection::open_in_memory().unwrap();
 
-  conn.attach(":memory:", "NAME").unwrap();
+  assert!(
+    conn
+      .execute(
+        "
+          CREATE TABLE test (id INTEGER PRIMARY KEY);
+          ATTACH DATABASE ':memory:' AS foo;
+        ",
+        (),
+      )
+      .await
+      .is_err()
+  );
+
+  conn
+    .write_query_rows("ATTACH DATABASE ':memory:' AS foo", ())
+    .await
+    .unwrap();
+
+  conn.attach(":memory:", "bar").await.unwrap();
 
   let databases = conn.list_databases().await.unwrap();
-  assert_eq!(databases.len(), 2);
+  assert_eq!(databases.len(), 3);
   assert_eq!(
-    databases[1],
+    databases[2],
     Database {
-      seq: 2,
-      name: "NAME".to_string(),
+      seq: 3,
+      name: "bar".to_string(),
     }
   );
+
+  conn.detach("bar").await.unwrap();
+  conn.detach("foo").await.unwrap();
+
+  let databases = conn.list_databases().await.unwrap();
+  assert_eq!(databases.len(), 1);
+}
+
+#[test]
+fn test_busy() {
+  let rt = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(4)
+    .enable_all()
+    .build()
+    .unwrap();
+
+  let tmp_dir = tempfile::TempDir::new().unwrap();
+  let db_path = tmp_dir.path().join("main.sqlite");
+
+  let conn = Connection::with_opts(
+    move || -> Result<_, rusqlite::Error> {
+      let conn = rusqlite::Connection::open(&db_path)?;
+
+      // NOTE: The busy handler should NEVER be triggered, since exclusive locking happens on the
+      // `Connection` level. BUSY_TIMEOUT would only trigger if multiple SQLite connections
+      // were trying to lock the DB concurrently.
+      conn
+        .busy_timeout(std::time::Duration::from_micros(1))
+        .unwrap();
+      conn
+        .busy_handler(Some(|_| -> bool {
+          assert!(false);
+          return false;
+        }))
+        .unwrap();
+
+      return Ok(conn);
+    },
+    Options {
+      num_threads: Some(3),
+      ..Default::default()
+    },
+  )
+  .unwrap();
+
+  rt.block_on(async move {
+    conn
+      .execute_batch(
+        "
+        CREATE TABLE test (
+            id    INTEGER PRIMARY KEY,
+            data  TEXT
+        ) STRICT;
+
+        INSERT INTO test (data) VALUES ('a'), ('b'), ('c');
+      ",
+      )
+      .await
+      .unwrap();
+
+    // We use writes for SELECTs to trigger busy states.
+    const N: usize = 10000;
+    let futures: Vec<_> = (0..N)
+      .map(|_| {
+        let conn = conn.clone();
+        return tokio::spawn(async move {
+          conn
+            .write_query_rows("SELECT * FROM test", ())
+            .await
+            .unwrap();
+        });
+      })
+      .collect();
+
+    for result in join_all(futures).await {
+      result.unwrap();
+    }
+  });
+}
+
+#[tokio::test]
+async fn test_execute_returning_rows() {
+  let conn = Connection::open_in_memory().unwrap();
+
+  assert!(matches!(
+    conn.execute("SELECT 4;", ()).await,
+    Err(Error::ExecuteReturnedResults)
+  ));
+
+  // Make sure rusqlite and trailabse_sqlite consistently succeed for `execute_batch()`.
+  conn.execute_batch("SELECT 4;").await.unwrap();
+  let c = rusqlite::Connection::open_in_memory().unwrap();
+  c.execute_batch("SELECT 4;").unwrap();
 }

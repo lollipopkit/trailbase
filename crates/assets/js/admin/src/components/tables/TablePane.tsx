@@ -27,7 +27,6 @@ import type {
 } from "@tanstack/solid-table";
 import { createColumnHelper } from "@tanstack/solid-table";
 import type { DialogTriggerProps } from "@kobalte/core/dialog";
-import { geojsonToWKT } from "@terraformer/wkt";
 import { urlSafeBase64Decode } from "trailbase";
 
 import { Header } from "@/components/Header";
@@ -78,8 +77,8 @@ import {
   UploadedFiles,
 } from "@/components/tables/Files";
 
-import { parseWkb } from "@/lib/wkb";
 import { createConfigQuery } from "@/lib/api/config";
+import { wkbToWkt } from "@/lib/geometry";
 import type { Record, ArrayRecord } from "@/lib/record";
 import { hashSqlValue } from "@/lib/value";
 import { urlSafeBase64ToUuid, toHex, safeParseInt } from "@/lib/utils";
@@ -113,6 +112,7 @@ import type { Table } from "@bindings/Table";
 import type { TableIndex } from "@bindings/TableIndex";
 import type { TableTrigger } from "@bindings/TableTrigger";
 import type { View } from "@bindings/View";
+import { createWritableMemo } from "@solid-primitives/memo";
 
 export type SimpleSignal<T> = [get: () => T, set: (state: T) => void];
 
@@ -164,8 +164,7 @@ function renderCell(
           );
         }
         case "Geometry": {
-          const geometry = parseWkb(urlSafeBase64Decode(blob.Base64UrlSafe));
-          return geojsonToWKT(geometry);
+          return wkbToWkt(urlSafeBase64Decode(blob.Base64UrlSafe));
         }
       }
 
@@ -987,7 +986,7 @@ export function TablePane(props: {
   const selectedSchema = () => props.selectedTable[0];
   const isTable = () => tableType(selectedSchema()) === "table";
 
-  // IMPORTANT: We need to memo the search params to treat absence and defaults
+  // IMPORTANT: We need to memo the downstream search params use to treat absence and defaults
   // consistently, otherwise `undefined`->`default` may invalidate the cursors.
   const [searchParams, setSearchParams] = useSearchParams<SearchParams>();
   const filter = createMemo(() => searchParams.filter);
@@ -1014,7 +1013,13 @@ export function TablePane(props: {
     });
   };
 
-  const [sorting, setSortingImpl] = createSignal<SortingState>([]);
+  const [sorting, setSortingImpl] = createWritableMemo<SortingState>(() => {
+    // TODO: Represent sorting state in `searchParams`, e.g. `?order=+col1,-col2`.
+    // Meanwhile this needs it's own reset.
+    const _ = [selectedSchema()];
+
+    return [];
+  });
   const setSorting = (s: Updater<SortingState>) => {
     // Reset pagination.
     setSearchParams({

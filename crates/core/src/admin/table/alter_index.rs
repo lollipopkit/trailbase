@@ -6,7 +6,7 @@ use ts_rs::TS;
 
 use crate::admin::AdminError as Error;
 use crate::app_state::AppState;
-use crate::transaction::TransactionRecorder;
+use crate::transaction_recorder::TransactionRecorder;
 
 #[derive(Clone, Debug, Deserialize, TS)]
 #[ts(export)]
@@ -54,17 +54,17 @@ pub async fn alter_index_handler(
   let unqualified_source_index_name = request.source_schema.name.name.clone();
 
   let tx_log = conn
-    .call(move |conn| {
-      let mut tx = TransactionRecorder::new(conn)?;
+    .transaction(move |tx| {
+      let mut tx = TransactionRecorder::new(tx);
 
       // Drop old index
       tx.execute(
-        &format!("DROP INDEX \"{unqualified_source_index_name}\""),
+        format!("DROP INDEX \"{unqualified_source_index_name}\""),
         (),
       )?;
 
       // Create new index
-      tx.execute(&create_index_query, ())?;
+      tx.execute(create_index_query, ())?;
 
       return tx
         .rollback()

@@ -1,39 +1,47 @@
-use log::*;
 use parking_lot::RwLock;
 use quick_cache::sync::GuardResult;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use trailbase_extension::jsonschema::JsonSchemaRegistry;
 use trailbase_schema::metadata::ConnectionMetadata;
-use trailbase_schema::sqlite::{Table, View};
+
+pub use trailbase_sqlite::{Connection, unpack_other_error};
 
 use crate::data_dir::DataDir;
 use crate::migrations::{
   apply_base_migrations, apply_logs_migrations, apply_main_migrations, apply_session_migrations,
 };
+use crate::schema_metadata::build_metadata;
 use crate::wasm::{SqliteFunctions, SqliteStore};
-
-pub use trailbase_sqlite::Connection;
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
-  #[error("SQLite ext: {0}")]
-  SqliteExtension(#[from] trailbase_extension::Error),
-  #[error("Schema: {0}")]
+  #[error("ExtensionError: {0}")]
+  Extension(#[from] trailbase_extension::Error),
+  #[error("SqlError: {0}")]
+  Sql(#[from] trailbase_sqlite::Error),
+  #[error("SchemaError: {0}")]
   Schema(#[from] crate::schema_metadata::SchemaLookupError),
-  #[error("Rusqlite: {0}")]
-  Rusqlite(#[from] rusqlite::Error),
-  #[error("TB SQLite: {0}")]
-  TbSqlite(#[from] trailbase_sqlite::Error),
   #[error("Migration: {0}")]
   Migration(#[from] trailbase_refinery::Error),
-  #[error("Json Schema: {0}")]
-  JsonSchema(#[from] trailbase_schema::metadata::JsonSchemaError),
-  #[error("Other: {0}")]
-  Other(String),
+  #[error("MissingMetadata")]
+  MissingMetadata,
+  #[error("Timeout")]
+  Timeout,
+  #[error("SettingsError: {0}")]
+  InvalidSetting(&'static str),
+  // Used during runtime config/schema reloads.
+  #[error("ConfigError: {0}")]
+  ConfigError(#[from] crate::config::ConfigError),
+}
+
+// Packaging helper.
+impl From<ConnectionError> for trailbase_sqlite::Error {
+  fn from(err: ConnectionError) -> Self {
+    return trailbase_sqlite::Error::Other(err.into());
+  }
 }
 
 pub struct AttachedDatabase {
@@ -72,6 +80,7 @@ struct ConnectionManagerState {
   // Properties for caching connections:
   main: RwLock<ConnectionEntry>,
   connections: quick_cache::sync::Cache<ConnectionKey, ConnectionEntry>,
+  pg_uri: Option<String>,
 }
 
 // A manager for multi-DB SQLite connections.
@@ -83,21 +92,40 @@ pub struct ConnectionManager {
   state: Arc<ConnectionManagerState>,
 }
 
-impl ConnectionManager {
-  pub(crate) fn new(
-    data_dir: DataDir,
-    json_schema_registry: Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
-    sqlite_function_runtimes: Vec<(SqliteStore, SqliteFunctions)>,
-  ) -> Result<(Self, bool), ConnectionError> {
-    let (main_conn, new_db) = init_main_db_impl(
-      Some(&data_dir),
-      Some(json_schema_registry.clone()),
-      vec![],
-      sqlite_function_runtimes.clone(),
-      true,
-    )?;
+pub struct Options {
+  pub data_dir: DataDir,
+  pub json_schema_registry: Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
+  pub sqlite_function_runtimes: Vec<(SqliteStore, SqliteFunctions)>,
+  pub pg_uri: Option<String>,
+}
 
-    let main_metadata = build_metadata(&main_conn.write_lock(), &json_schema_registry)?;
+#[derive(Clone, Debug, Default)]
+pub struct BuildOptions {
+  pub is_main: bool,
+  pub attached_databases: Option<BTreeSet<String>>,
+  pub num_threads: Option<usize>,
+}
+
+impl ConnectionManager {
+  pub(crate) async fn new(opts: Options) -> Result<(Self, bool), ConnectionError> {
+    let (main_conn, main_metadata, new_db) = init_db(InitDbOptions {
+      data_path: Some(&opts.data_dir.main_db_path()),
+      migration_path: Some(&opts.data_dir.migrations_path()),
+      is_main_db: true,
+      json_registry: &opts.json_schema_registry,
+      runtimes: &opts.sqlite_function_runtimes,
+      attach: vec![],
+      num_threads: None,
+      pg_uri: opts.pg_uri.clone(),
+    })
+    .await?;
+
+    let Options {
+      data_dir,
+      json_schema_registry,
+      sqlite_function_runtimes,
+      pg_uri,
+    } = opts;
 
     return Ok((
       Self {
@@ -110,6 +138,7 @@ impl ConnectionManager {
             metadata: Arc::new(main_metadata),
           }),
           connections: quick_cache::sync::Cache::new(256),
+          pg_uri,
         }),
       },
       new_db,
@@ -117,22 +146,32 @@ impl ConnectionManager {
   }
 
   #[cfg(test)]
-  pub(crate) fn new_for_test(
+  pub(crate) async fn new_for_test(
     data_dir: DataDir,
     json_schema_registry: Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
     sqlite_function_runtimes: Vec<(SqliteStore, SqliteFunctions)>,
+    pg_uri: Option<String>,
   ) -> Self {
-    let (main_conn, new_db) = init_main_db_impl(
-      None,
-      Some(json_schema_registry.clone()),
-      vec![],
-      sqlite_function_runtimes.clone(),
-      true,
-    )
+    let (main_conn, main_metadata, new_db) = init_db(InitDbOptions {
+      data_path: None,
+      migration_path: None,
+      is_main_db: true,
+      json_registry: &json_schema_registry,
+      runtimes: &sqlite_function_runtimes,
+      attach: vec![],
+      num_threads: None,
+      pg_uri: pg_uri.clone(),
+    })
+    .await
     .unwrap();
-    assert!(new_db);
 
-    let main_metadata = build_metadata(&main_conn.write_lock(), &json_schema_registry).unwrap();
+    if !new_db {
+      if cfg!(feature = "pg") {
+        log::warn!("Re-using existing DB for test :/. Should only happen for shared external DBs.");
+      } else {
+        panic!("Expected 'fresh' DB for test");
+      }
+    }
 
     return Self {
       state: Arc::new(ConnectionManagerState {
@@ -144,6 +183,7 @@ impl ConnectionManager {
           metadata: Arc::new(main_metadata),
         }),
         connections: quick_cache::sync::Cache::new(256),
+        pg_uri,
       }),
     };
   }
@@ -152,44 +192,30 @@ impl ConnectionManager {
     return self.state.main.read().clone();
   }
 
-  pub fn get_entry(
-    &self,
-    main: bool,
-    attached_databases: Option<BTreeSet<String>>,
-  ) -> Result<ConnectionEntry, ConnectionError> {
-    if main && attached_databases.is_none() {
+  pub async fn get_entry(&self, opts: BuildOptions) -> Result<ConnectionEntry, ConnectionError> {
+    if opts.is_main && opts.attached_databases.is_none() {
       return Ok(self.state.main.read().clone());
     }
 
     let key = ConnectionKey {
-      main,
-      attached_databases: attached_databases.unwrap_or_default(),
+      main: opts.is_main,
+      attached_databases: opts.attached_databases.clone().unwrap_or_default(),
     };
 
     return match self.state.connections.get_value_or_guard(&key, None) {
       GuardResult::Value(entry) => Ok(entry.clone()),
       GuardResult::Guard(placeholder) => {
-        let conn = self.build(main, Some(&key.attached_databases))?;
-
-        let entry = ConnectionEntry {
-          connection: conn.clone(),
-          metadata: Arc::new(build_metadata(
-            &conn.write_lock(),
-            &self.state.json_schema_registry,
-          )?),
-        };
-
+        let entry = self.build(opts).await?;
         let _ = placeholder.insert(entry.clone());
-
         Ok(entry)
       }
       GuardResult::Timeout => {
-        return Err(ConnectionError::Other("Timeout".into()));
+        return Err(ConnectionError::Timeout);
       }
     };
   }
 
-  pub fn get_entry_for_qn(
+  pub async fn get_entry_for_qn(
     &self,
     name: &trailbase_schema::QualifiedName,
   ) -> Result<ConnectionEntry, ConnectionError> {
@@ -198,26 +224,29 @@ impl ConnectionManager {
     {
       // QUESTION: Should we disallow access to "logs", "auth", etc? Currently, this is not
       // exposed to WASM, i.e. there's no sanctioned way to interact with this.
-      return self.get_entry(false, Some([db.to_string()].into()));
+      return self
+        .get_entry(BuildOptions {
+          is_main: false,
+          attached_databases: Some([db.to_string()].into()),
+          ..Default::default()
+        })
+        .await;
     }
 
     return Ok(self.main_entry());
   }
 
-  pub(crate) fn build(
-    &self,
-    mut main: bool,
-    attached_databases: Option<&BTreeSet<String>>,
-  ) -> Result<Arc<Connection>, ConnectionError> {
+  pub(crate) async fn build(&self, opts: BuildOptions) -> Result<ConnectionEntry, ConnectionError> {
     #[cfg(test)]
-    if main && attached_databases.is_none() {
-      return Ok(self.state.main.read().connection.clone());
+    if opts.is_main && opts.attached_databases.is_none() {
+      return Ok(self.state.main.read().clone());
     }
 
-    let attach = if let Some(attached_databases) = attached_databases {
+    let mut is_main = opts.is_main;
+    let attach = if let Some(attached_databases) = opts.attached_databases {
       // SQLite supports only up to 125 DBs per connection: https://sqlite.org/limits.html.
       if attached_databases.len() > 124 {
-        return Err(ConnectionError::Other("Too many databases".into()));
+        return Err(ConnectionError::InvalidSetting("Too many databases"));
       }
 
       attached_databases
@@ -226,7 +255,7 @@ impl ConnectionManager {
           if name != "main" {
             Some(AttachedDatabase::from_data_dir(&self.state.data_dir, name))
           } else {
-            main = true;
+            is_main = true;
             None
           }
         })
@@ -235,35 +264,40 @@ impl ConnectionManager {
       vec![]
     };
 
-    let (conn, _new_db) = init_main_db_impl(
-      Some(&self.state.data_dir),
-      Some(self.state.json_schema_registry.clone()),
+    let (conn, metadata, _new_db) = init_db(InitDbOptions {
+      data_path: Some(&self.state.data_dir.main_db_path()),
+      migration_path: Some(&self.state.data_dir.migrations_path()),
+      is_main_db: is_main,
+      json_registry: &self.state.json_schema_registry,
+      runtimes: &self.state.sqlite_function_runtimes,
       attach,
-      self.state.sqlite_function_runtimes.clone(),
-      main,
-    )?;
+      num_threads: opts.num_threads,
+      pg_uri: self.state.pg_uri.clone(),
+    })
+    .await?;
 
-    return Ok(Arc::new(conn));
+    return Ok(ConnectionEntry {
+      connection: Arc::new(conn),
+      metadata: Arc::new(metadata),
+    });
   }
 
   // Updates connection metadata for cached connections.
-  pub(crate) fn rebuild_metadata(&self) -> Result<(), ConnectionError> {
+  pub(crate) async fn rebuild_metadata(&self) -> Result<(), ConnectionError> {
     // Main
     {
-      let new_metadata = Arc::new(build_metadata(
-        &self.state.main.read().connection.write_lock(),
-        &self.state.json_schema_registry,
-      )?);
+      let new_metadata = Arc::new({
+        let conn = self.state.main.read().connection.clone();
+        build_metadata(&conn, &self.state.json_schema_registry).await?
+      });
 
       self.state.main.write().metadata = new_metadata;
     }
 
     // Others:
     for (key, entry) in self.state.connections.iter() {
-      let new_metadata = Arc::new(build_metadata(
-        &entry.connection.write_lock(),
-        &self.state.json_schema_registry,
-      )?);
+      let new_metadata =
+        Arc::new(build_metadata(&entry.connection, &self.state.json_schema_registry).await?);
 
       let _ = self.state.connections.replace(
         key,
@@ -279,121 +313,182 @@ impl ConnectionManager {
   }
 }
 
-pub(crate) fn build_metadata(
-  conn: &rusqlite::Connection,
-  json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
-) -> Result<ConnectionMetadata, ConnectionError> {
-  use crate::schema_metadata::*;
-  let tables = lookup_and_parse_all_table_schemas_sync(conn)?;
-  let views = lookup_and_parse_all_view_schemas_sync(conn, &tables)?;
-
-  return build_connection_metadata_and_install_file_deletion_triggers_sync(
-    conn,
-    tables,
-    views,
-    json_schema_registry,
-  );
-}
-
-/// Initializes a new SQLite Connection with all the default extensions, migrations and settings
-/// applied.
-///
-/// Returns a Connection and whether the DB was newly created..
-pub fn init_main_db(
-  data_dir: Option<&DataDir>,
-  json_registry: Option<Arc<RwLock<JsonSchemaRegistry>>>,
-  attached_databases: Vec<AttachedDatabase>,
-  runtimes: Vec<(SqliteStore, SqliteFunctions)>,
-) -> Result<(Connection, bool), ConnectionError> {
-  // SQLite supports only up to 125 DBs per connection: https://sqlite.org/limits.html.
-  if attached_databases.len() > 124 {
-    return Err(ConnectionError::Other("Too many databases".into()));
-  }
-
-  return init_main_db_impl(data_dir, json_registry, attached_databases, runtimes, true);
-}
-
-fn init_main_db_impl(
-  data_dir: Option<&DataDir>,
-  json_registry: Option<Arc<RwLock<JsonSchemaRegistry>>>,
+struct InitDbOptions<'a> {
+  data_path: Option<&'a PathBuf>,
+  migration_path: Option<&'a PathBuf>,
+  is_main_db: bool,
+  json_registry: &'a Arc<RwLock<JsonSchemaRegistry>>,
+  runtimes: &'a Vec<(SqliteStore, SqliteFunctions)>,
   attach: Vec<AttachedDatabase>,
-  runtimes: Vec<(SqliteStore, SqliteFunctions)>,
-  main_migrations: bool,
-) -> Result<(Connection, bool), ConnectionError> {
-  let main_path = data_dir.map(|d| d.main_db_path());
-  let migrations_path = data_dir.map(|d| d.migrations_path());
+  num_threads: Option<usize>,
 
-  let mut new_db = AtomicBool::new(false);
-  let conn = {
-    let migrations_path = migrations_path.clone();
-    let json_registry = json_registry.clone();
-    let new_db = &mut new_db;
+  #[allow(unused)]
+  pg_uri: Option<String>,
+}
 
-    trailbase_sqlite::Connection::new(
-      move || -> Result<_, ConnectionError> {
-        let mut conn =
-          trailbase_extension::connect_sqlite(main_path.clone(), json_registry.clone())?;
+#[cfg(feature = "pg")]
+async fn init_db<'a>(
+  opts: InitDbOptions<'a>,
+) -> Result<(Connection, ConnectionMetadata, bool), ConnectionError> {
+  let conn = trailbase_sqlite::Connection::pg_with_opts(if let Some(uri) = opts.pg_uri {
+    trailbase_sqlite::generic::PgOptions {
+      connection: trailbase_sqlite::generic::PgConnection::Uri(uri),
+      num_threads: Some(1),
+    }
+  } else {
+    let host = trailbase_sqlite::generic::PgConnection::Host {
+      host: Some("127.0.0.1".to_string()),
+      port: Some(5432),
+      user: Some("postgres".to_string()),
+      password: Some("example".to_string()),
+    };
+    log::warn!("External Postgres required: {host:?}");
 
-        #[cfg(any(feature = "geos", feature = "geos-static"))]
-        litegis::register(&conn)?;
+    trailbase_sqlite::generic::PgOptions {
+      connection: host,
+      num_threads: Some(2),
+    }
+  })?;
 
-        if main_migrations {
-          new_db.fetch_or(
-            apply_main_migrations(&mut conn, migrations_path.as_ref())?,
-            Ordering::SeqCst,
-          );
-        }
-
-        #[cfg(feature = "wasm")]
-        for (store, functions) in &runtimes {
-          trailbase_wasm_runtime_host::functions::setup_connection(&conn, store.clone(), functions)
-            .expect("startup");
-        }
-
-        return Ok(conn);
-      },
-      Some(trailbase_sqlite::connection::Options {
-        n_read_threads: match (data_dir, std::thread::available_parallelism()) {
-          (None, _) => 0,
-          (Some(_), Ok(n)) => n.get().clamp(2, 4),
-          (Some(_), Err(_)) => 4,
-        },
-        ..Default::default()
-      }),
-    )?
+  // Apply migrations.
+  //
+  // IMPORTANT: All extensions need to be loaded before to satisfy potential dependencies.
+  let init_schema = if opts.is_main_db {
+    apply_main_migrations(&conn, opts.migration_path)
+      .await
+      .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?
+  } else {
+    false
   };
 
-  for AttachedDatabase { schema_name, path } in attach {
-    debug!("Attaching '{schema_name}': {path:?}, {migrations_path:?}");
+  // TODO: Remove sanity check.
+  conn
+    .read_query_rows(
+      r#"SELECT EXISTS(SELECT 1 FROM "_user" WHERE email = 'foo')"#,
+      (),
+    )
+    .await
+    .unwrap();
 
-    if let Some(ref migrations_path) = migrations_path {
-      // NOTE: that migrations may also depend on extension functions.
-      // FIXME: Right now this will fail if user migrations depend on custom WASM SQLite functions.
-      let mut secondary =
-        trailbase_extension::connect_sqlite(Some(path.clone()), json_registry.clone())?;
-
-      #[cfg(any(feature = "geos", feature = "geos-static"))]
-      litegis::register(&secondary)?;
-
-      apply_base_migrations(&mut secondary, Some(migrations_path), &schema_name)?;
-    }
-
-    conn.attach(&path.to_string_lossy(), &schema_name)?;
-  }
-
-  // NOTE: We could consider larger memory maps and caches for the main database.
-  // Should be driven by benchmarks.
-  // conn.pragma_update(None, "mmap_size", 268435456)?;
-  // conn.pragma_update(None, "cache_size", -32768)?; // 32MB
-
-  return Ok((conn, new_db.load(Ordering::SeqCst)));
+  return Ok((conn, Default::default(), init_schema));
 }
 
-pub(super) fn init_logs_db(data_dir: Option<&DataDir>) -> Result<Connection, ConnectionError> {
+#[cfg(not(feature = "pg"))]
+async fn init_db<'a>(
+  opts: InitDbOptions<'a>,
+) -> Result<(Connection, ConnectionMetadata, bool), ConnectionError> {
+  if opts.attach.len() > 124 {
+    return Err(ConnectionError::InvalidSetting("Too many databases"));
+  }
+
+  fn build_connection(
+    db_path: Option<PathBuf>,
+    json_registry: Arc<RwLock<JsonSchemaRegistry>>,
+    runtimes: &Vec<(SqliteStore, SqliteFunctions)>,
+  ) -> Result<rusqlite::Connection, ConnectionError> {
+    let conn = trailbase_extension::connect_sqlite(db_path, Some(json_registry))?;
+
+    // Apply custom connection settings, e.g. PRAGMAs and client settings.
+    {
+      // The default is just 16.
+      conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+
+      // NOTE: We could consider larger memory maps and caches for the main database.
+      // Should be driven by benchmarks.
+      // conn.pragma_update(None, "mmap_size", 268435456)?;
+      // conn.pragma_update(None, "cache_size", -32768)?; // 32MB
+    }
+
+    #[cfg(any(feature = "geos", feature = "geos-static"))]
+    litegis::register(&conn).map_err(trailbase_extension::Error::Rusqlite)?;
+
+    // Install SQLite extension methods/functions registered by WASM components.
+    #[cfg(feature = "wasm")]
+    for (store, functions) in runtimes {
+      trailbase_wasm_runtime_host::functions::setup_connection(&conn, store.clone(), functions)
+        .map_err(trailbase_extension::Error::Rusqlite)?;
+    }
+
+    return Ok(conn);
+  }
+
+  let conn = trailbase_sqlite::Connection::with_opts(
+    {
+      let data_path = opts.data_path.cloned();
+      let json_registry = opts.json_registry.clone();
+      let runtimes = opts.runtimes.clone();
+
+      move || -> Result<rusqlite::Connection, ConnectionError> {
+        return build_connection(data_path.clone(), json_registry.clone(), &runtimes);
+      }
+    },
+    trailbase_sqlite::Options {
+      num_threads: Some(opts.num_threads.unwrap_or_else(|| {
+        // Fallback if not explicitly set.
+        match (opts.data_path, std::thread::available_parallelism()) {
+          (None, _) => 1,
+          (Some(_), Ok(n)) => n.get().clamp(2, 4),
+          (Some(_), Err(_)) => 2,
+        }
+      })),
+      ..Default::default()
+    },
+  )
+  .map_err(|err| {
+    // Unpack potentially packed ConnectionError.
+    return match unpack_other_error::<ConnectionError>(err) {
+      Ok(schema_lookup_err) => schema_lookup_err,
+      Err(sql_err) => sql_err.into(),
+    };
+  })?;
+
+  // Apply migrations.
+  //
+  // IMPORTANT: All extensions need to be loaded before to satisfy potential dependencies.
+  let init_schema = if opts.is_main_db {
+    apply_main_migrations(&conn, opts.migration_path)
+      .await
+      .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?
+  } else {
+    false
+  };
+
+  for AttachedDatabase { schema_name, path } in &opts.attach {
+    log::debug!(
+      "Attaching '{schema_name}': {path:?}, {:?}",
+      opts.migration_path
+    );
+
+    // Before attaching secondary DBs, we must ensure their schemas are up-to-date.
+    if let Some(ref migrations_path) = opts.migration_path {
+      let mut secondary = build_connection(
+        Some(path.clone()),
+        opts.json_registry.clone(),
+        opts.runtimes,
+      )?;
+
+      // Apply migrations.
+      //
+      // IMPORTANT: All extensions need to be loaded before to satisfy potential dependencies.
+      apply_base_migrations(&mut secondary, Some(migrations_path), schema_name)?;
+    }
+
+    conn.attach(&path.to_string_lossy(), schema_name).await?;
+  }
+
+  // Lastly, after attaching all DBs, build connection metadata.
+  let metadata = build_metadata(&conn, opts.json_registry).await?;
+
+  return Ok((conn, metadata, init_schema));
+}
+
+pub(super) fn init_logs_db(
+  data_dir: Option<&DataDir>,
+) -> Result<Connection, trailbase_sqlite::Error> {
   let path = data_dir.map(|d| d.logs_db_path());
 
-  return trailbase_sqlite::Connection::new(
-    || -> Result<_, ConnectionError> {
+  return trailbase_sqlite::Connection::with_opts(
+    || -> Result<_, trailbase_sqlite::Error> {
       // NOTE: The logs db needs the trailbase extensions for the maxminddb geoip lookup.
       let mut conn = connect_rusqlite_without_default_extensions_and_schemas(path.clone())?;
 
@@ -402,27 +497,33 @@ pub(super) fn init_logs_db(data_dir: Option<&DataDir>) -> Result<Connection, Con
       // Turn off secure_deletions, i.e. don't wipe the memory with zeros.
       conn.pragma_update(None, "secure_delete", "FALSE")?;
 
-      apply_logs_migrations(&mut conn)?;
+      apply_logs_migrations(&mut conn).map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
       return Ok(conn);
     },
-    None,
+    trailbase_sqlite::Options {
+      // Only using the writer, no readers (except for admin dash).
+      num_threads: Some(1),
+      ..Default::default()
+    },
   );
 }
 
-pub fn init_session_db(data_dir: Option<&DataDir>) -> Result<Connection, ConnectionError> {
+pub fn init_session_db(data_dir: Option<&DataDir>) -> Result<Connection, trailbase_sqlite::Error> {
   let path = data_dir.map(|d| d.session_db_path());
 
-  return trailbase_sqlite::Connection::new(
-    || -> Result<_, ConnectionError> {
+  return trailbase_sqlite::Connection::with_opts(
+    || -> Result<_, trailbase_sqlite::Error> {
       // NOTE: The logs db needs the trailbase extensions for the maxminddb geoip lookup.
       let mut conn = connect_rusqlite_without_default_extensions_and_schemas(path.clone())?;
 
       trailbase_extension::register_all_extension_functions(&conn, None)?;
 
-      apply_session_migrations(&mut conn)?;
+      apply_session_migrations(&mut conn)
+        .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
+
       return Ok(conn);
     },
-    None,
+    Default::default(),
   );
 }
 
@@ -445,76 +546,25 @@ pub(crate) fn connect_rusqlite_without_default_extensions_and_schemas(
   // Initial optimize.
   conn.pragma_update(None, "optimize", "0x10002")?;
 
+  // The default is just 16.
+  conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+
   // Rusqlite's default is 5s.
   conn.busy_timeout(std::time::Duration::from_millis(5000))?;
 
   return Ok(conn);
 }
 
-/// (Re-)build the connections schema representation *with* the side-effect of (re-)installing file
-/// deletion triggers.
-///
-/// Tying the construction of schema metadata and the (re-)installing of file deletion triggers so
-/// closely together is a necessary evil. For example, whenever a schema changes, e.g. a new file
-/// column is added, we need to rebuild the metadata and update or install missing triggers.
-fn build_connection_metadata_and_install_file_deletion_triggers_sync(
-  conn: &rusqlite::Connection,
-  tables: Vec<Table>,
-  views: Vec<View>,
-  registry: &RwLock<JsonSchemaRegistry>,
-) -> Result<ConnectionMetadata, ConnectionError> {
-  let metadata = ConnectionMetadata::from_schemas(tables, views, &registry.read())?;
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 256;
 
-  setup_file_deletion_triggers_sync(conn, &metadata)?;
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn test_db_connetion_type() {
+    // Assert that we're not using th the polymorphic connection in non-pg mode. The below
+    // constructor only exists on sqlite flavor.
 
-  return Ok(metadata);
-}
-
-// Install file column triggers. This ain't pretty, this might be better on construction and
-// schema changes.
-fn setup_file_deletion_triggers_sync(
-  conn: &rusqlite::Connection,
-  metadata: &ConnectionMetadata,
-) -> Result<(), trailbase_sqlite::Error> {
-  for metadata in metadata.tables.values() {
-    for column_meta in &metadata.column_metadata {
-      if !column_meta.is_file {
-        continue;
-      }
-
-      let table_name = &metadata.schema.name;
-      let unqualified_name = &metadata.schema.name.name;
-      let db = metadata
-        .schema
-        .name
-        .database_schema
-        .as_deref()
-        .unwrap_or("main");
-
-      let column_name = &column_meta.column.name;
-
-      conn.execute_batch(&format!(
-          "\
-          DROP TRIGGER IF EXISTS '{db}'.'__{unqualified_name}__{column_name}__update_trigger'; \
-          CREATE TRIGGER IF NOT EXISTS '{db}'.'__{unqualified_name}__{column_name}__update_trigger' AFTER UPDATE ON {table_name} \
-            WHEN OLD.\"{column_name}\" IS NOT NULL AND OLD.\"{column_name}\" != NEW.\"{column_name}\" \
-            BEGIN \
-              INSERT INTO _file_deletions (table_name, record_rowid, column_name, json) VALUES \
-                ('{table_name}', OLD._rowid_, '{column_name}', OLD.\"{column_name}\"); \
-            END; \
-          \
-          DROP TRIGGER IF EXISTS '{db}'.'__{unqualified_name}__{column_name}__delete_trigger'; \
-          CREATE TRIGGER IF NOT EXISTS '{db}'.'__{unqualified_name}__{column_name}__delete_trigger' AFTER DELETE ON {table_name} \
-            WHEN OLD.\"{column_name}\" IS NOT NULL \
-            BEGIN \
-              INSERT INTO _file_deletions (table_name, record_rowid, column_name, json) VALUES \
-                ('{table_name}', OLD._rowid_, '{column_name}', OLD.\"{column_name}\"); \
-            END; \
-          ",
-          table_name = table_name.escaped_string(),
-        ))?;
-    }
+    #[cfg(not(feature = "pg"))]
+    trailbase_sqlite::Connection::new(|| rusqlite::Connection::open_in_memory()).unwrap();
   }
-
-  return Ok(());
 }

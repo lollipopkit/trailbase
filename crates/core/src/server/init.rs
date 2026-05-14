@@ -79,11 +79,14 @@ pub async fn init_app_state(args: InitArgs) -> Result<(bool, AppState), InitErro
   .await
   .map_err(|err| InitError::ScriptError(err.to_string()))?;
 
-  let (connection_manager, new_db) = ConnectionManager::new(
-    args.data_dir.clone(),
-    json_schema_registry.clone(),
-    sync_wasm_runtimes,
-  )?;
+  let (connection_manager, new_db) = ConnectionManager::new(crate::connection::Options {
+    data_dir: args.data_dir.clone(),
+    json_schema_registry: json_schema_registry.clone(),
+    sqlite_function_runtimes: sync_wasm_runtimes,
+    // TODO: Wire up from config, if/when PG is supported.
+    pg_uri: None,
+  })
+  .await?;
 
   // Read config or write default one. Ensures config is validated.
   let config = load_or_init_config_textproto(&args.data_dir, &connection_manager).await?;
@@ -118,15 +121,16 @@ pub async fn init_app_state(args: InitArgs) -> Result<(bool, AppState), InitErro
     jwt,
     object_store,
     wasm_tokio_runtime: args.wasm_tokio_runtime,
-  });
+  })
+  .await;
 
   if new_db {
     let num_admins: i64 = app_state
       .user_conn()
-      .read_query_row_f(
+      .read_query_row_get(
         format!("SELECT COUNT(*) FROM {USER_TABLE} WHERE admin = TRUE"),
         (),
-        |row| row.get(0),
+        0,
       )
       .await?
       .unwrap_or(0);

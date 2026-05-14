@@ -22,7 +22,7 @@ mod migrations;
 mod scheduler;
 mod schema_metadata;
 mod server;
-mod transaction;
+mod transaction_recorder;
 
 #[cfg(feature = "wasm")]
 mod wasm;
@@ -43,6 +43,7 @@ mod wasm {
 
   impl KvStore {
     pub(crate) fn new() -> Self {
+      #[allow(clippy::default_constructed_unit_structs)]
       return Self::default();
     }
 
@@ -135,7 +136,7 @@ pub mod openapi {
 pub mod api {
   pub use crate::admin::user::{CreateUserRequest, create_user_handler};
   pub use crate::auth::{AuthTokenClaims, JwtHelper, cli};
-  pub use crate::connection::{Connection, init_main_db, init_session_db};
+  pub use crate::connection::Connection;
   pub use crate::email::{Email, EmailError};
   pub use crate::migrations::new_unique_migration_filename;
   pub use crate::records::json_schema::build_api_json_schema;

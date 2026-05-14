@@ -37,6 +37,7 @@ use crate::auth::util::is_admin;
 use crate::auth::{self, AuthError, User};
 use crate::constants::{ADMIN_API_PATH, HEADER_CSRF_TOKEN};
 use crate::data_dir::DataDir;
+use crate::extract::ip::RealIpKeyExtractor;
 use crate::logging;
 use crate::records;
 
@@ -170,18 +171,21 @@ impl Server {
     // Install an Ip-based rate limiter on auth APIs to avoid abuse.
     //
     // NOTE: If you run into rate-limits and are running behind a reverse proxy, please set the
-    // "x-forwarded-for" header correctly to ensure ip-based rate limitting and request logging
+    // "x-forwarded-for" header correctly to ensure ip-based rate limiting and request logging
     // works correctly.
-    // TODO: we should probably also allow user-configured rate limits on record APIs.
-    let install_auth_rate_limiter = {
+    // NOTE: We're using a closure here because of the awkward typing.
+    let install_auth_rate_limiter = if !opts.dev
+      && let Some(rate_limit) = state.get_config().server.auth_ip_rate_limit
+      && rate_limit > 0
+    {
       let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
           // Quota.
-          .burst_size(if cfg!(debug_assertions) { 50 } else { 5 })
-          // Replenish one after 2 seconds.
-          .per_second(2)
-          .key_extractor(crate::extract::ip::RealIpKeyExtractor)
-          // Set rate limiting headers on reply
+          .burst_size(rate_limit)
+          // Replenish one after 1 seconds.
+          .per_second(1)
+          .key_extractor(RealIpKeyExtractor)
+          // Set rate limiting headers on reply.
           .use_headers()
           // Only block POST method for abuse prevention (e.g. sign-up, ...), e.g. allow unlimited
           // GET auth status.
@@ -201,7 +205,11 @@ impl Server {
         }
       });
 
-      move |router: Router<crate::AppState>| router.layer(GovernorLayer::new(governor_conf.clone()))
+      Some(move |router: Router<crate::AppState>| {
+        router.layer(GovernorLayer::new(governor_conf.clone()))
+      })
+    } else {
+      None
     };
 
     Ok(Self {
@@ -209,22 +217,14 @@ impl Server {
       main_router: Self::build_main_router(
         &state,
         &opts,
-        if opts.dev {
-          None
-        } else {
-          Some(&install_auth_rate_limiter)
-        },
+        install_auth_rate_limiter.as_ref(),
         custom_routers,
       )
       .await?,
       admin_router: Self::build_independent_admin_router(
         &state,
         &opts,
-        if opts.dev {
-          None
-        } else {
-          Some(&install_auth_rate_limiter)
-        },
+        install_auth_rate_limiter.as_ref(),
       ),
       tls: Self::load_tls(&opts),
     })
@@ -314,15 +314,11 @@ impl Server {
           //
           // TODO: Right now we're only re-applying main migrations.
           let user_migrations_path = state.data_dir().migrations_path();
-          match state
-            .connection_manager()
-            .main_entry()
-            .connection
-            .call(|conn: &mut rusqlite::Connection| {
-              return crate::migrations::apply_main_migrations(conn, Some(user_migrations_path))
-                .map_err(|err| trailbase_sqlite::Error::Other(err.into()));
-            })
+          let conn = state.connection_manager().main_entry().connection;
+
+          match crate::migrations::apply_main_migrations(&conn, Some(user_migrations_path))
             .await
+            .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
           {
             Err(err) => {
               // NOTE: it's not clear what the best error behavior here is. Should the server
@@ -549,9 +545,16 @@ impl Server {
           .on_request(logging::sqlite_logger_on_request)
           .on_response(logging::sqlite_logger_on_response),
       )
-      // Default is only 2MB Increase to 10MB.
+      // Default request size limit is only 2MB Increase to 10MB by default if no explicit user
+      // limit is provided.
       .layer(DefaultBodyLimit::disable())
-      .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+      .layer(RequestBodyLimitLayer::new(
+        state
+          .get_config()
+          .server
+          .request_size_limit_bytes
+          .map_or(10 * 1024 * 1024, |limit| limit as usize),
+      ))
       .with_state(state.clone());
   }
 }
@@ -649,39 +652,61 @@ async fn shutdown_signal() {
   #[cfg(not(unix))]
   let terminate = std::future::pending::<()>();
 
-  async fn timer() {
-    use tokio::time::*;
+  fn start_shutdown_timer(handle: tokio::runtime::Handle) {
+    std::thread::spawn(move || {
+      let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("We're shutting down and failed to start the watch timer - might as well panic.");
 
-    const SECONDS: usize = 10;
+      rt.block_on(async {
+        use tokio::time::*;
 
-    for remaining in (0..SECONDS).rev() {
-      tokio::select! {
-        _ = sleep(Duration::from_secs(1)) => {}
-        _ = signal::ctrl_c() => {
-            println!("Got Ctrl+C. Shutting down");
-            std::process::exit(1);
+        log::debug!(
+          "Shutdown watchdog started. Pending tasks: {}",
+          handle.metrics().num_alive_tasks()
+        );
+
+        const SECONDS: usize = 10;
+
+        for remaining in (0..SECONDS).rev() {
+          tokio::select! {
+            _ = sleep(Duration::from_secs(1)) => {}
+            _ = signal::ctrl_c() => {
+                println!("Got another Ctrl+C => force shutdown");
+                std::process::exit(1);
+            }
+          };
+
+          if remaining > 0 {
+            println!(
+              "Waiting {SECONDS}s for graceful shutdown (pending: {}): {remaining}s remaining.",
+              handle.metrics().num_alive_tasks()
+            );
+          } else {
+            println!("Graceful shutdown failed. Shutting down");
+            std::process::exit(0);
+          }
         }
-      };
-
-      if remaining > 0 {
-        println!("Waiting {SECONDS}s for graceful shutdown: {remaining}s remaining.");
-      } else {
-        println!("Graceful shutdown failed. Shutting down");
-        std::process::exit(0);
-      }
-    }
+      })
+    });
   }
 
+  let rt = tokio::runtime::Handle::current();
+
+  // We're spawning a timer. We *must* not await it. Otherwise we're holding up the shut-down.
   tokio::select! {
       _ = ctrl_c => {
       println!("Received Ctrl+C. Shutting down gracefully.");
-      tokio::spawn(timer());
+      start_shutdown_timer(rt);
     },
       _ = terminate => {
       println!("Received termination. Shutting down gracefully.");
-      tokio::spawn(timer());
+      start_shutdown_timer(rt);
     },
-  }
+  };
+
+  // Ready to shut down.
 }
 
 pub async fn serve(
@@ -689,6 +714,18 @@ pub async fn serve(
   admin_router: Option<(String, Router)>,
   tls: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  // Make sure TLS provider is installed (both for incoming and outgoing traffic, including traffic
+  // from WASM components).
+  use tokio_rustls::rustls::crypto;
+  if crypto::CryptoProvider::get_default().is_none() {
+    info!("No process-wide TLS provider found. Falling back to `aws_lc_rs`.");
+    if let Err(_provider) = crypto::aws_lc_rs::default_provider().install_default() {
+      // QUESTION: Should this be a panic or is this still acceptable for users who don't
+      // need TLS (neither to serve nor for WASM components).
+      error!("Installing fallback TLS provider failed.");
+    }
+  }
+
   let has_tls = tls.is_some();
   let addr = main_router.0.clone();
   let admin_addr = admin_router
@@ -738,13 +775,12 @@ async fn start_listen(
 
   if let Err(err) = match tls {
     Some((cert, key)) => {
+      info!("TLS enabled");
+
       serve::serve(
         serve::TlsListener {
           listener: tcp_listener,
           acceptor: TlsAcceptor::from(Arc::new({
-            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-              .install_default()
-              .expect("Failed to install rustls crypto");
             ServerConfig::builder()
               .with_no_client_auth()
               .with_single_cert(vec![cert], key)

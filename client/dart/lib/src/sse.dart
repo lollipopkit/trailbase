@@ -2,19 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
+import 'package:meta/meta.dart';
 
-class HttpException implements Exception {
-  final int status;
-  final String? message;
-
-  const HttpException(this.status, this.message);
-
-  @override
-  String toString() => 'HttpException(${status}, "${message}")';
-}
+import './transport.dart';
 
 sealed class Event {
+  final int? seq;
+
+  const Event(this.seq);
+
   Map<String, dynamic>? get value;
 }
 
@@ -22,7 +18,7 @@ class InsertEvent extends Event {
   @override
   final Map<String, dynamic> value;
 
-  InsertEvent(this.value);
+  InsertEvent(super.seq, this.value);
 
   @override
   String toString() => 'InsertEvent(${value})';
@@ -32,7 +28,7 @@ class UpdateEvent extends Event {
   @override
   final Map<String, dynamic> value;
 
-  UpdateEvent(this.value);
+  UpdateEvent(super.seq, this.value);
 
   @override
   String toString() => 'UpdateEvent(${value})';
@@ -42,33 +38,46 @@ class DeleteEvent extends Event {
   @override
   final Map<String, dynamic> value;
 
-  DeleteEvent(this.value);
+  DeleteEvent(super.seq, this.value);
 
   @override
   String toString() => 'DeleteEvent(${value})';
 }
 
 class ErrorEvent extends Event {
-  final String _error;
+  final int _status;
+  final String? _message;
 
-  ErrorEvent(this._error);
+  static const int statusUnknown = 0;
+  static const int statusForbidden = 1;
+  static const int statusEventLoss = 2;
+
+  ErrorEvent(super.seq, this._status, this._message);
 
   @override
   Map<String, dynamic>? get value => null;
 
+  int get status => _status;
+  String? get message => _message;
+
   @override
-  String toString() => 'ErrorEvent(${_error})';
+  String toString() => 'ErrorEvent(${_status}, ${_message})';
 }
 
 Future<Stream<Event>> connectSse(
-  http.Client client,
-  http.Request request, {
+  Transport client,
+  Uri uri, {
+  Map<String, String>? headers,
   Map<String, Future<StreamController<Event>>>? cache,
 }) async {
-  final key = request.url.toString();
+  final key = uri.toString();
 
   Future<StreamController<Event>> connectSseImpl() async {
-    final response = await client.send(request);
+    final response = await client.stream(
+      uri,
+      headers: headers,
+    );
+
     if (response.statusCode != 200) {
       throw HttpException(response.statusCode, response.toString());
     }
@@ -92,10 +101,10 @@ Future<Stream<Event>> connectSse(
               if (buffer.isNotEmpty) {
                 buffer.add(data);
 
-                final event = _decodeEvent(buffer.takeBytes());
+                final event = decodeEvent(buffer.takeBytes());
                 if (event != null) ctrl.add(event);
               } else {
-                final event = _decodeEvent(data);
+                final event = decodeEvent(data);
                 if (event != null) ctrl.add(event);
               }
             } else {
@@ -128,30 +137,36 @@ bool _endsWithNewlineNewline(List<int> bytes) {
 }
 
 Event _eventfromJson(Map<String, dynamic> json) {
+  final seq = json['seq'] as int?;
   final insert = json['Insert'];
   if (insert != null) {
-    return InsertEvent(insert as Map<String, dynamic>);
+    return InsertEvent(seq, insert as Map<String, dynamic>);
   }
 
   final update = json['Update'];
   if (update != null) {
-    return UpdateEvent(update as Map<String, dynamic>);
+    return UpdateEvent(seq, update as Map<String, dynamic>);
   }
 
   final delete = json['Delete'];
   if (delete != null) {
-    return DeleteEvent(delete as Map<String, dynamic>);
+    return DeleteEvent(seq, delete as Map<String, dynamic>);
   }
 
   final error = json['Error'];
   if (error != null) {
-    return ErrorEvent(error as String);
+    return ErrorEvent(
+      seq,
+      (error['status'] as int?) ?? ErrorEvent.statusUnknown,
+      error['message'] as String?,
+    );
   }
 
   throw Exception('Failed to parse event: ${json}');
 }
 
-Event? _decodeEvent(List<int> bytes) {
+@visibleForTesting
+Event? decodeEvent(List<int> bytes) {
   final decoded = utf8.decode(bytes);
   if (decoded.startsWith('data: ')) {
     // Cut off "data: " and decode.

@@ -17,7 +17,7 @@ mod tests {
     acls: Acls,
     access_rules: AccessRules,
   ) -> Result<(), crate::config::ConfigError> {
-    let mut config = state.get_config();
+    let mut config = (*state.get_config()).clone();
 
     config.record_apis.push(RecordApiConfig {
       name: Some(api_name.to_string()),
@@ -46,7 +46,7 @@ mod tests {
     state: &AppState,
     api: RecordApiConfig,
   ) -> Result<(), crate::config::ConfigError> {
-    let mut config = state.get_config();
+    let mut config = (*state.get_config()).clone();
     config.record_apis.push(api);
     return state.validate_and_update_config(config, None).await;
   }
@@ -73,6 +73,7 @@ mod tests {
 
   pub async fn create_chat_message_app_tables(state: &AppState) -> Result<(), anyhow::Error> {
     // Create a messages, chat room and members tables.
+    #[cfg(not(feature = "pg"))]
     state
       .conn()
       .execute_batch(
@@ -89,21 +90,57 @@ mod tests {
             data         TEXT NOT NULL DEFAULT 'empty',
 
             -- Dummy column with a name requiring escaping.
-            'table'      INTEGER NOT NULL DEFAULT 0,
+            "table"      INTEGER NOT NULL DEFAULT 0,
 
-            -- on user delete, toombstone it.
+            -- on user delete, tombstone it.
             FOREIGN KEY(_owner) REFERENCES _user(id) ON DELETE SET NULL,
-            -- On chatroom delete, delete message
+            -- On chat room delete, delete message
             FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE
           ) STRICT;
 
           CREATE TABLE room_members (
-            user         BLOB NOT NULL,
+            "user"       BLOB NOT NULL,
             room         BLOB NOT NULL,
 
             FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE,
-            FOREIGN KEY(user) REFERENCES _user(id) ON DELETE CASCADE
+            FOREIGN KEY("user") REFERENCES _user(id) ON DELETE CASCADE
           ) STRICT;
+        "#,
+      )
+      .await?;
+
+    #[cfg(feature = "pg")]
+    state
+      .conn()
+      .execute_batch(
+        r#"
+          CREATE TABLE room (
+            rid          UUID PRIMARY KEY NOT NULL DEFAULT(gen_random_uuid()),
+            name         TEXT
+          );
+
+          CREATE TABLE message (
+            mid          UUID PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+            _owner       UUID NOT NULL,
+            room         UUID NOT NULL,
+            data         TEXT NOT NULL DEFAULT 'empty',
+
+            -- Dummy column with a name requiring escaping.
+            "table"      INT8 NOT NULL DEFAULT 0,
+
+            -- on user delete, tombstone it.
+            FOREIGN KEY(_owner) REFERENCES _user(id) ON DELETE SET NULL,
+            -- On chat room delete, delete message
+            FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE
+          );
+
+          CREATE TABLE room_members (
+            "user"       UUID NOT NULL,
+            room         UUID NOT NULL,
+
+            FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE,
+            FOREIGN KEY("user") REFERENCES _user(id) ON DELETE CASCADE
+          );
         "#,
       )
       .await?;
@@ -117,6 +154,7 @@ mod tests {
     state: &AppState,
   ) -> Result<(), anyhow::Error> {
     // Create a messages, chat room and members tables.
+    #[cfg(not(feature = "pg"))]
     state
       .conn()
       .execute_batch(
@@ -132,19 +170,52 @@ mod tests {
             room         BLOB NOT NULL,
             data         TEXT NOT NULL DEFAULT 'empty',
 
-            -- on user delete, toombstone it.
+            -- on user delete, tombstone it.
             FOREIGN KEY(_owner) REFERENCES _user(id) ON DELETE SET NULL,
-            -- On chatroom delete, delete message
+            -- On chat room delete, delete message
             FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE
           ) STRICT;
 
           CREATE TABLE room_members (
-            user         BLOB NOT NULL,
+            "user"       BLOB NOT NULL,
             room         BLOB NOT NULL,
 
             FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE,
-            FOREIGN KEY(user) REFERENCES _user(id) ON DELETE CASCADE
+            FOREIGN KEY("user") REFERENCES _user(id) ON DELETE CASCADE
           ) STRICT;
+        "#,
+      )
+      .await?;
+
+    #[cfg(feature = "pg")]
+    state
+      .conn()
+      .execute_batch(
+        r#"
+          CREATE TABLE room (
+            rid          UUID PRIMARY KEY NOT NULL DEFAULT(gen_random_uuid()),
+            name         TEXT
+          );
+
+          CREATE TABLE message (
+            mid          INT8 PRIMARY KEY,
+            _owner       UUID NOT NULL,
+            room         UUID NOT NULL,
+            data         TEXT NOT NULL DEFAULT 'empty',
+
+            -- on user delete, tombstone it.
+            FOREIGN KEY(_owner) REFERENCES _user(id) ON DELETE SET NULL,
+            -- On chat room delete, delete message
+            FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE
+          );
+
+          CREATE TABLE room_members (
+            "user"       UUID NOT NULL,
+            room         UUID NOT NULL,
+
+            FOREIGN KEY(room) REFERENCES room(rid) ON DELETE CASCADE,
+            FOREIGN KEY("user") REFERENCES _user(id) ON DELETE CASCADE
+          );
         "#,
       )
       .await?;
@@ -159,10 +230,10 @@ mod tests {
     name: &str,
   ) -> Result<[u8; 16], anyhow::Error> {
     let room: [u8; 16] = conn
-      .query_row_f(
+      .write_query_row_get(
         "INSERT INTO room (name) VALUES ($1) RETURNING rid",
         params!(name.to_string()),
-        |row| row.get(0),
+        0,
       )
       .await?
       .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
@@ -177,7 +248,7 @@ mod tests {
   ) -> Result<(), trailbase_sqlite::Error> {
     conn
       .execute(
-        "INSERT INTO room_members (user, room) VALUES ($1, $2)",
+        "INSERT INTO room_members (\"user\", room) VALUES ($1, $2)",
         params!(user, room),
       )
       .await?;
@@ -191,10 +262,10 @@ mod tests {
     message: &str,
   ) -> Result<[u8; 16], anyhow::Error> {
     let id: [u8; 16] = conn
-      .query_row_f(
+      .write_query_row_get(
         "INSERT INTO message (_owner, room, data) VALUES ($1, $2, $3) RETURNING mid",
         params!(user, room, message.to_string()),
-        |row| row.get(0),
+        0,
       )
       .await?
       .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
@@ -207,6 +278,14 @@ mod tests {
       serde_json::Value::Object(map) => Ok(map),
       _ => Err(anyhow::anyhow!("Not an object: {value:?}")),
     };
+  }
+
+  pub fn conditionally_transform_query(sql: impl AsRef<str>) -> String {
+    #[cfg(feature = "pg")]
+    return sql.as_ref().replace("STRICT", "");
+
+    #[cfg(not(feature = "pg"))]
+    return sql.as_ref().to_string();
   }
 }
 

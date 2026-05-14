@@ -8,7 +8,7 @@ use ts_rs::TS;
 use crate::admin::AdminError as Error;
 use crate::app_state::AppState;
 use crate::config::proto::hash_config;
-use crate::transaction::{TransactionLog, TransactionRecorder};
+use crate::transaction_recorder::{TransactionLog, TransactionRecorder};
 
 #[derive(Clone, Debug, Deserialize, TS)]
 pub enum AlterTableOperation {
@@ -92,10 +92,9 @@ pub async fn alter_table_handler(
     ephemeral_table_schema.name.database_schema = None;
 
     conn
-      .call(
-        move |conn| -> Result<Option<TransactionLog>, trailbase_sqlite::Error> {
-          let mut tx = TransactionRecorder::new(conn)
-            .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
+      .transaction(
+        move |tx| -> Result<Option<TransactionLog>, trailbase_sqlite::Error> {
+          let mut tx = TransactionRecorder::new(tx);
 
           // Defer any foreign key checks until transaction is being committed.
           // NOTE: This is *not* enough for other references, e.g. VIEWs and INDEXes.
@@ -104,7 +103,7 @@ pub async fn alter_table_handler(
 
           // Create new table
           let sql = ephemeral_table_schema.create_table_statement();
-          tx.execute(&sql, ()).map_err(|err| {
+          tx.execute(sql.clone(), ()).map_err(|err| {
             warn!("Failed creating ephemeral table, likely invalid operations: {sql}\n\t{err}");
             return err;
           })?;
@@ -123,10 +122,10 @@ pub async fn alter_table_handler(
             source_columns = escape_and_join_column_names(&source_columns),
             target_columns = escape_and_join_column_names(&target_columns),
           );
-          tx.execute(&insert_data_query, ())?;
+          tx.execute(insert_data_query, ())?;
 
           tx.execute(
-            &format!("DROP TABLE \"{unqualified_source_table_name}\""),
+            format!("DROP TABLE \"{unqualified_source_table_name}\""),
             (),
           )?;
 
@@ -137,7 +136,7 @@ pub async fn alter_table_handler(
             // rename).
             tx.execute("PRAGMA legacy_alter_table = ON", ())?;
             tx.execute(
-              &format!(
+              format!(
                 "ALTER TABLE \"{unqualified_ephemeral_table_name}\" RENAME TO \"{unqualified_target_name}\""
               ),
               (),
@@ -168,7 +167,7 @@ pub async fn alter_table_handler(
 
     // Fix configuration: update all table references by existing APIs.
     if source_table_schema.name != target_table_name {
-      let mut config = state.get_config();
+      let mut config = (*state.get_config()).clone();
       let old_config_hash = hash_config(&config);
 
       for api in &mut config.record_apis {

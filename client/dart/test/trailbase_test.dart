@@ -180,6 +180,9 @@ Future<Process> initTrailBase() async {
     '--runtime-threads=2',
   ]);
 
+  process.stderr.listen(stderr.add);
+  process.stdout.listen(stdout.add);
+
   final uri = Uri.parse('http://${address}/api/healthcheck');
   for (int i = 0; i < 100; ++i) {
     try {
@@ -200,9 +203,6 @@ Future<Process> initTrailBase() async {
 
   process.kill(ProcessSignal.sigkill);
   final exitCode = await process.exitCode;
-
-  await process.stderr.forEach(stdout.add);
-  await process.stdout.forEach(stdout.add);
 
   throw Exception('Cargo run failed: ${exitCode}.');
 }
@@ -228,9 +228,6 @@ Future<void> main() async {
     tearDownAll(() async {
       process.kill(ProcessSignal.sigkill);
       final _ = await process.exitCode;
-
-      // await process.stderr.forEach(stdout.add);
-      // await process.stdout.forEach(stdout.add);
     });
   }
 
@@ -261,6 +258,8 @@ Future<void> main() async {
 
       await client.logout();
       expect(client.tokens(), isNull);
+
+      await client.refreshAuthToken();
 
       // We need to wait a little to push the expiry time in seconds to avoid just getting the same token minted again.
       await Future.delayed(Duration(milliseconds: 1500));
@@ -579,9 +578,17 @@ Future<void> main() async {
       final client = await connect();
       final api = client.records('simple_schema_table');
 
-      await api.create({
-        'data': '{ "name": "Eve" }',
-      });
+      expect(() async {
+        // data object is string encoded.
+        await api.create({
+          'data': '{ "name": "TheEntireObjectIsAString" }',
+        });
+      }, throwsA(predicate((e) {
+        if (e is HttpException) {
+          return e.status == HttpStatus.badRequest;
+        }
+        return false;
+      })));
 
       final id = await api.create({
         'data': {'name': 'Eve'},

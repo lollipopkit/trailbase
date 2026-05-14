@@ -6,7 +6,7 @@ use ts_rs::TS;
 
 use crate::admin::AdminError as Error;
 use crate::app_state::AppState;
-use crate::transaction::TransactionRecorder;
+use crate::transaction_recorder::TransactionRecorder;
 
 #[derive(Clone, Debug, Deserialize, TS)]
 #[ts(export)]
@@ -40,12 +40,12 @@ pub async fn drop_index_handler(
   let tx_log = {
     let unqualified_index_name = unqualified_index_name.clone();
     conn
-      .call(move |conn| {
-        let mut tx = TransactionRecorder::new(conn)?;
+      .transaction(move |tx| {
+        let mut tx = TransactionRecorder::new(tx);
 
         let query = format!("DROP INDEX IF EXISTS \"{unqualified_index_name}\"");
         debug!("dropping index: {query}");
-        tx.execute(&query, ())?;
+        tx.execute(query, ())?;
 
         return tx
           .rollback()

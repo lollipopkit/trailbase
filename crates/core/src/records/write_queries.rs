@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use trailbase_schema::QualifiedNameEscaped;
-use trailbase_sqlite::{Connection, NamedParams, Params as _, Value};
+use trailbase_sqlite::traits::SyncTransaction;
+use trailbase_sqlite::{Connection, NamedParams, Value};
 
 use crate::config::proto::ConflictResolutionStrategy;
 use crate::records::error::RecordError;
@@ -121,42 +122,91 @@ impl WriteQuery {
     });
   }
 
-  pub fn apply(self, conn: &rusqlite::Connection) -> Result<WriteQueryResult, rusqlite::Error> {
+  async fn apply_async(
+    self,
+    conn: &trailbase_sqlite::Connection,
+  ) -> Result<WriteQueryResult, trailbase_sqlite::Error> {
     return match self {
       Self::Insert {
         query,
         named_params,
       } => {
-        let mut stmt = conn.prepare_cached(query.as_ref())?;
-        named_params.bind(&mut stmt)?;
-        if let Some(row) = stmt.raw_query().next()? {
+        if let Some(row) = conn.write_query_row(query, named_params).await? {
           Ok(WriteQueryResult {
             rowid: row.get(0)?,
             pk_value: Some(row.get(1)?),
           })
         } else {
-          Err(rusqlite::Error::QueryReturnedNoRows)
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
         }
       }
       Self::Update {
         query,
         named_params,
       } => {
-        let mut stmt = conn.prepare_cached(query.as_ref())?;
-        named_params.bind(&mut stmt)?;
-        if let Some(row) = stmt.raw_query().next()? {
+        if let Some(rowid) = conn.write_query_row_get(query, named_params, 0).await? {
+          Ok(WriteQueryResult {
+            rowid,
+            pk_value: None,
+          })
+        } else {
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
+        }
+      }
+      Self::Delete { query, pk_value } => {
+        if let Some(rowid) = conn.write_query_row_get(query, [pk_value], 0).await? {
+          Ok(WriteQueryResult {
+            rowid,
+            pk_value: None,
+          })
+        } else {
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
+        }
+      }
+    };
+  }
+
+  pub(super) fn apply_sync(
+    self,
+    conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
+  ) -> Result<WriteQueryResult, trailbase_sqlite::Error> {
+    return match self {
+      Self::Insert {
+        query,
+        named_params,
+      } => {
+        if let Some(row) = conn.query_row(query, named_params)? {
+          Ok(WriteQueryResult {
+            rowid: row.get(0)?,
+            pk_value: Some(row.get(1)?),
+          })
+        } else {
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
+        }
+      }
+      Self::Update {
+        query,
+        named_params,
+      } => {
+        if let Some(row) = conn.query_row(query, named_params)? {
           Ok(WriteQueryResult {
             rowid: row.get(0)?,
             pk_value: None,
           })
         } else {
-          Err(rusqlite::Error::QueryReturnedNoRows)
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
         }
       }
-      Self::Delete { query, pk_value } => Ok(WriteQueryResult {
-        rowid: conn.query_row(&query, [pk_value], |row| row.get(0))?,
-        pk_value: None,
-      }),
+      Self::Delete { query, pk_value } => {
+        if let Some(row) = conn.query_row(query, [pk_value])? {
+          Ok(WriteQueryResult {
+            rowid: row.get(0)?,
+            pk_value: None,
+          })
+        } else {
+          Err(rusqlite::Error::QueryReturnedNoRows.into())
+        }
+      }
     };
   }
 }
@@ -168,7 +218,7 @@ pub(crate) async fn run_queries(
     WriteQuery,
     Option<(QualifiedNameEscaped, FileMetadataContents)>,
   )>,
-) -> Result<Vec<rusqlite::types::Value>, RecordError> {
+) -> Result<Vec<trailbase_sqlite::Value>, RecordError> {
   let (queries, all_files): (Vec<_>, Vec<_>) = queries.into_iter().unzip();
 
   let mut queries_with_files = HashMap::<QualifiedNameEscaped, Vec<usize>>::new();
@@ -200,12 +250,10 @@ pub(crate) async fn run_queries(
   };
 
   let result: Vec<WriteQueryResult> = conn
-    .call(move |conn| {
-      let tx = conn.transaction()?;
-
+    .transaction(move |mut tx| -> Result<_, trailbase_sqlite::Error> {
       let rows: Vec<WriteQueryResult> = queries
         .into_iter()
-        .map(|query| query.apply(&tx))
+        .map(|query| query.apply_sync(&mut tx))
         .collect::<Result<Vec<_>, _>>()?;
 
       tx.commit()?;
@@ -238,7 +286,7 @@ pub(crate) async fn run_insert_query(
   conflict_resolution: Option<ConflictResolutionStrategy>,
   return_column_name: &str,
   params: Params,
-) -> Result<rusqlite::types::Value, RecordError> {
+) -> Result<trailbase_sqlite::Value, RecordError> {
   let (query, files) =
     WriteQuery::new_insert(table_name, return_column_name, conflict_resolution, params)?;
 
@@ -250,12 +298,10 @@ pub(crate) async fn run_insert_query(
     Some(FileManager::write(objectstore, files).await?)
   };
 
-  let (rowid, return_value): (i64, rusqlite::types::Value) = conn
-    .call(move |conn| {
-      let result = query.apply(conn)?;
-      return Ok((result.rowid, result.pk_value.expect("insert")));
-    })
-    .await?;
+  let WriteQueryResult { rowid, pk_value } = query.apply_async(conn).await?;
+  let Some(return_value) = pk_value else {
+    return Err(RecordError::Internal("missing pk".into()));
+  };
 
   // Successful write, do not cleanup written files.
   if let Some(mut file_manager) = file_manager {
@@ -287,11 +333,7 @@ pub(crate) async fn run_update_query(
     Some(FileManager::write(objectstore, files).await?)
   };
 
-  let rowid: i64 = conn
-    .call(move |conn| {
-      return Ok(query.apply(conn)?.rowid);
-    })
-    .await?;
+  let WriteQueryResult { rowid, pk_value: _ } = query.apply_async(conn).await?;
 
   // Successful write, do not cleanup written files.
   if let Some(mut file_manager) = file_manager {
@@ -314,11 +356,7 @@ pub(crate) async fn run_delete_query(
 ) -> Result<i64, RecordError> {
   let query = WriteQuery::new_delete(table_name, pk_column, pk_value)?;
 
-  let rowid: i64 = conn
-    .call(move |conn| {
-      return Ok(query.apply(conn)?.rowid);
-    })
-    .await?;
+  let WriteQueryResult { rowid, pk_value: _ } = query.apply_async(conn).await?;
 
   if has_file_columns {
     delete_files_marked_for_deletion(conn, objectstore, table_name, &[rowid])

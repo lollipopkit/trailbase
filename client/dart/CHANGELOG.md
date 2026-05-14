@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.1
+
+- Log out if token refresh fails with an "unauthorized" error (401).
+
+## 0.10.0
+
+- Update change `Event`s to contain sequence numbers.
+- Update change `ErrorEvent` to contain programmatic status.
+
+## 0.9.0
+
+- Add a `Transport` abstraction to allow for custom implementations. This can be used for testing or production use-cases like injecting headers such as `X-Forwarded-For`.
+
 ## 0.8.0
 
 - Add support for two-factor TOTP (e.g. authenticator app) login.

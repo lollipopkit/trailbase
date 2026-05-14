@@ -130,6 +130,21 @@ impl Guest for Endpoints {
 
         tx.commit().map_err(internal)?;
 
+        // Keep one dangling to make sure RAII-cleanup works.
+        let _tx_dangling = Transaction::begin();
+
+        return Ok(());
+      }),
+      routing::get("/attach_db", async |_req| {
+        let _ = execute("ATTACH DATABASE foo.db AS foo", vec![])
+          .await
+          .map_err(internal)?;
+        return Ok(());
+      }),
+      routing::get("/detach_db", async |_req| {
+        let _ = query("DETACH DATABASE foo", vec![])
+          .await
+          .map_err(internal)?;
         return Ok(());
       }),
       // Benchmark runtime performance.
@@ -165,20 +180,6 @@ impl Guest for Endpoints {
           panic!("/panic called");
         }
         return Ok(());
-      }),
-      routing::get("/test_sqlean", async |_req| {
-        // sqlean: Define a stored procedure, use it, and remove it.
-        let _ = query("SELECT define('sumn', ':n * (:n + 1) / 2')", vec![])
-          .await
-          .unwrap();
-
-        let Value::Integer(value) = query("SELECT sumn(5)", vec![]).await.unwrap()[0][0] else {
-          return Err(internal("expected int"));
-        };
-
-        let _ = query("SELECT undefine('sumn')", vec![]).await.unwrap();
-
-        return Ok(format!("{value}"));
       }),
       routing::get("/test_sqlite-vec", async |_req| {
         let Value::Blob(ref vec) = query("SELECT vec_f32('[0, 1, 2, 3]')", vec![])

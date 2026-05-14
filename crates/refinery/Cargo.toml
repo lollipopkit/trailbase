@@ -17,9 +17,12 @@ regex = "1"
 rusqlite = { workspace = true }
 siphasher = "1.0"
 thiserror = "2"
+trailbase-sqlite = { workspace = true }
 time = { version = "0.3.5", features = ["parsing", "formatting"] }
 walkdir = "2.3.1"
 
 [dev-dependencies]
 temp-dir = "0.2.0"
 tempfile = "3.1.0"
+tokio = { workspace = true }
+futures-util = { workspace = true }

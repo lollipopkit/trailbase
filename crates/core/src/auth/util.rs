@@ -56,6 +56,7 @@ pub fn validate_and_normalize_email_address(email_address: &str) -> Result<Strin
 fn validate_redirect_impl(
   site: Option<&url::Url>,
   custom_uri_schemes: &[String],
+  redirect_allow_list: &[String],
   redirect: &str,
   dev: bool,
 ) -> Result<(), AuthError> {
@@ -82,6 +83,15 @@ fn validate_redirect_impl(
       }
     }
 
+    // Allow explicitly allow-listed redirect uri.
+    if redirect_allow_list
+      .iter()
+      .find(|allowed| *allowed == redirect)
+      .is_some()
+    {
+      return Ok(());
+    }
+
     if dev
       && match url.host() {
         Some(url::Host::Ipv4(ip)) if ip.is_loopback() => true,
@@ -104,11 +114,13 @@ pub(crate) fn validate_redirect<T: AsRef<str>>(
 ) -> Result<Option<T>, AuthError> {
   if let Some(ref redirect_uri) = redirect_uri {
     let site: &Option<url::Url> = &state.site_url();
-    let custom_uri_schemes = state.access_config(|c| c.auth.custom_uri_schemes.clone());
+
+    let config = state.get_config();
 
     validate_redirect_impl(
       site.as_ref(),
-      &custom_uri_schemes,
+      &config.auth.custom_uri_schemes,
+      &config.auth.redirect_uri_allowlist,
       redirect_uri.as_ref(),
       state.dev_mode(),
     )?;
@@ -172,21 +184,32 @@ pub async fn login_with_password(
 }
 
 pub(crate) fn new_cookie(
+  state: &AppState,
   key: &'static str,
   value: String,
   ttl: Duration,
-  dev: bool,
 ) -> Cookie<'static> {
-  return Cookie::build((key, value))
-    .path("/")
-    // Not available to client-side JS.
-    .http_only(true)
-    // Only send cookie over HTTPs.
-    .secure(!dev)
-    // Only include cookie if request originates from origin site.
-    .same_site(if dev { SameSite::Lax } else { SameSite::Strict })
-    .max_age(cookie::time::Duration::seconds(ttl.num_seconds()))
-    .build();
+  // TODO: We may want to make `same_site` configurable. By default we pick the strict setting,
+  // i.e. have browsers not attach the cookie when coming from another site. This can prevent
+  // some o the most blatant XSS attacks, however generally isn't enough. For example,
+  // same-origin user-generated content can by-pass this. When cookies are used, forms should
+  // also check the CSRF token.
+  return new_cookie_opts(
+    key,
+    value,
+    ttl,
+    /* tls_only= */ secure_tls_only(state),
+    /* same_site= */ true,
+  );
+}
+
+#[inline]
+pub(crate) fn secure_tls_only(state: &AppState) -> bool {
+  // Be strict in prod-mode and when the site is configured with HTTPS/TLS.
+  return !state.dev_mode()
+    && (*state.site_url())
+      .as_ref()
+      .is_some_and(|url| url.scheme() == "https");
 }
 
 pub(crate) fn new_cookie_opts(
@@ -218,7 +241,13 @@ pub(crate) fn new_cookie_opts(
 /// thus override them.
 pub(crate) fn remove_cookie(cookies: &Cookies, key: &'static str) {
   if cookies.get(key).is_some() {
-    cookies.add(new_cookie(key, "".to_string(), Duration::seconds(1), false));
+    cookies.add(new_cookie_opts(
+      key,
+      "".to_string(),
+      Duration::seconds(1),
+      /* tls_only= */ false,
+      /* same_site= */ false,
+    ));
   }
 }
 
@@ -275,12 +304,10 @@ pub async fn user_exists(state: &AppState, email: &str) -> bool {
 
   return match state
     .user_conn()
-    .read_query_row_f(QUERY, params!(email.to_string()), |row| {
-      row.get::<_, bool>(0)
-    })
+    .read_query_row_get::<bool>(QUERY, params!(email.to_string()), 0)
     .await
   {
-    Ok(Some(row)) => row,
+    Ok(Some(exists)) => exists,
     Ok(None) => false,
     Err(err) => {
       debug_assert!(false, "USER EXISTS query failed: {err}");
@@ -295,9 +322,7 @@ pub(crate) async fn is_admin(state: &AppState, user_id: &uuid::Uuid) -> bool {
 
   return match state
     .user_conn()
-    .read_query_row_f(QUERY, params!(user_id.as_bytes().to_vec()), |row| {
-      row.get::<_, i64>(0)
-    })
+    .read_query_row_get::<i64>(QUERY, params!(user_id.as_bytes().to_vec()), 0)
     .await
   {
     Ok(Some(row)) => row > 0,
@@ -374,37 +399,69 @@ mod tests {
   #[test]
   fn test_validate_redirect_impl() {
     let empty_site: Option<url::Url> = None;
-    assert!(validate_redirect_impl(empty_site.as_ref(), &[], "", true).is_err());
-    assert!(validate_redirect_impl(empty_site.as_ref(), &[], "/somewhere", false).is_ok());
+    assert!(validate_redirect_impl(empty_site.as_ref(), &[], &[], "", true).is_err());
+    assert!(validate_redirect_impl(empty_site.as_ref(), &[], &[], "/somewhere", false).is_ok());
     assert!(
       validate_redirect_impl(
         empty_site.as_ref(),
         &["custom".to_string()],
+        &[],
         "custom://somewhere",
         false
       )
       .is_ok()
     );
-    assert!(validate_redirect_impl(empty_site.as_ref(), &[], "http://localhost", false).is_err());
-    assert!(validate_redirect_impl(empty_site.as_ref(), &[], "http://127.0.0.1", false).is_err());
-    assert!(validate_redirect_impl(empty_site.as_ref(), &[], "http://localhost", true).is_ok());
+    assert!(
+      validate_redirect_impl(empty_site.as_ref(), &[], &[], "http://localhost", false).is_err()
+    );
+    assert!(
+      validate_redirect_impl(empty_site.as_ref(), &[], &[], "http://127.0.0.1", false).is_err()
+    );
+    assert!(
+      validate_redirect_impl(empty_site.as_ref(), &[], &[], "http://localhost", true).is_ok()
+    );
 
     let site = Some(url::Url::parse("https://test.org").unwrap());
-    assert!(validate_redirect_impl(site.as_ref(), &[], "/somewhere", false).is_ok());
+    assert!(validate_redirect_impl(site.as_ref(), &[], &[], "/somewhere", false).is_ok());
     assert!(
-      validate_redirect_impl(site.as_ref(), &[], "https://test.org/somewhere", false).is_ok()
+      validate_redirect_impl(site.as_ref(), &[], &[], "https://test.org/somewhere", false).is_ok()
     );
     assert!(
-      validate_redirect_impl(site.as_ref(), &[], "https://other.org/somewhere", false).is_err()
+      validate_redirect_impl(
+        site.as_ref(),
+        &[],
+        &[],
+        "https://other.org/somewhere",
+        false
+      )
+      .is_err()
     );
     assert!(
-      validate_redirect_impl(site.as_ref(), &[], "custom://test.org/somewhere", false).is_err()
+      validate_redirect_impl(
+        site.as_ref(),
+        &[],
+        &[],
+        "custom://test.org/somewhere",
+        false
+      )
+      .is_err()
     );
     assert!(
       validate_redirect_impl(
         site.as_ref(),
         &["custom".to_string()],
+        &[],
         "custom://test.org/somewhere",
+        false
+      )
+      .is_ok()
+    );
+    assert!(
+      validate_redirect_impl(
+        site.as_ref(),
+        &[],
+        &["https://test.org/somewhere".to_string()],
+        "https://test.org/somewhere",
         false
       )
       .is_ok()

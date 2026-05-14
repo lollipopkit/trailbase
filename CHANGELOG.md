@@ -1,3 +1,187 @@
+## v0.27.4
+
+- Better support for multi-line RecordApi access rules in admin UI by use of `<textarea>`, monospace fonts & some minor layout tweaks.
+- Fix stale UI proto definitions and add a `pre-commit` codegen task to avoid this in the future.
+- Add better CI coverage for WebSocket builds and non-default cargo features.
+- Update dependencies.
+
+## v0.27.3
+
+- Fix reset of sort/ordering state in admin table explorer when changing active schema.
+- Support a truly arbitrary number of databases in admin list tables API.
+- Stop using cached metadata for table explorer API.
+- Make shutdown watchdog more informative and robust, i.e. don't rely on runtime being shut down.
+- Update dependencies.
+
+## v0.27.2
+
+- Mainline many Postgres related changes and wiring. This is mostly a no-op, since everything is behind a cargo feature flag. When enabled, this is far from being ready and many tests are failing, especially tests requiring schema metadata.
+  - Add a runtime `ConnectionType` to polymorphic connection allowing refinery's `version_history` schema to apply conditionally.
+  - Alternate psql-compatible "base" migrations.
+  - Support named PG parameters with underscores.
+  - Fork `pgrow2serde` and add support for more types: arrays (e.g. `[u8; 16]`), UUID, ... .
+  - Wire up `pglite-oxide` for testing. Pretty promising but still new and issues to be worked out (e.g. error handling, broken RNG).
+  - Support a wider set of `FromSql`/`ToSql` conversions for `trailbase_sqlite::Value`.
+  - Hoist `ExecuteReturnedResults` error and fix `execute()` for PG.
+- Fix connection clean-up.
+- Overhaul custom-endpoint/UI tutorial.
+- Update dependencies.
+
+## v0.27.1
+
+- Consistently initialize rustls TLS binaries at the binary root. Previously, outgoing HTTPS traffic may have caused panics when not properly initialized. Thanks @jimmydjabali 🙏.
+- Small optimization: increase connection re-use and reduce spawning of threads across admin APIs.
+- Remove legacy `_session` table. Session data now lives in a separate DB.
+- Update dependencies.
+
+## v0.27.0
+
+- Cleanup release: remove the Sqlean's `define()` extensions for stored procedures. Breaking for users of Sqlean.
+  - Read queries modify connection state, therefore don't work with the `query_only` pragma resulting in elevated scheduling requirements.
+  - Doesn't allow anything that isn't possible with `VIEW` + WASM SQLite extensions.
+  - Is another source of SQLite lock-in, while we're moving towards loosened coupling.
+- Other major changes since the previous major release are mostly around DB coupling and execution model.
+  - There is a proof-of-concept Postgres driver now but it would still be a long way to hook it up:
+    - different SQL dialects,
+    - schema extraction missing,
+    - dependencies on SQLite extensions for `CHECK()`, migrations, etc.,
+    - change notifications for RecordApi subscriptions would need to work very differently,
+    - more fun surprises...?
+- Lift Rust MVRV (1.93) and Rust toolchain (1.95) versions.
+
+## v0.26.9
+
+- Enable custom WASM SQLite extension functions in multi-DB migrations.
+- Apply migrations asynchronously to further untangle DB implementation from execution model.
+- Improve error handling and simplify bespoke initialization order of DB connection.
+- Update dependencies.
+
+## v0.26.8
+
+- Add two new SQL connection types: a postgres one and a polymorphic one with runtime dispatch.
+  - This is mostly a proof-of-concept. Tests pass with the polymorphic connection pointing at SQLite but using postgres entails many more challenges:
+    - different SQL dialects,
+    - schema extraction missing,
+    - dependencies on SQLite extensions for `CHECK()`, migrations, etc.,
+    - change notifications for RecordApi subscriptions would need to work very differently,
+    - more fun surprises...?
+- Introduce a new `AsyncReactive` + snapshot primitive to further entangle DB connection establishment from the execution model, i.e. allow establishing connection asynchronously and thus `RecordApi`s.
+- Update dependencies.
+
+## v0.26.7
+
+- Fix CLI regression for `user` and `admin` commands due to DB initialization order changes.
+- Fix missing version identifier in `--version` for CI release builds. There were two issues: shallow checkouts and permissions for docker MUSL builds.
+- Admin UI: For geospatial data show EWKT SRID only when present and fix form prefill during record update for WKT.
+- Add `&skip_cursor` parameter for RecordAPI listing to help with GeoJSON consumers who don't support the `foreign_member` standard extension.
+- More work towards untangling TrailBase from SQLite specifics: make lock acquisition fallible.
+- Update dependencies.
+
+## v0.26.6
+
+- Admin UI improvements:
+  - Allow using WKT-formatted geometries in row insert/update forms.
+  - Early client-side validation of RecordAPI names.
+  - Show toast close button on small screens w/o hover.
+- Add `execute_batch()` to `SyncConnectionTrait` for downstream schema metadata building code.
+- Remove more use-cases of leaky `Connection::write_lock()` abstraction.
+- Update dependencies.
+
+## v0.26.5
+
+- Remove most leaky abstractions from `trailbase_sqlite::Connection`:
+  - Introduce an async `Connection::transaction()` API to remove many `.call_reader()` calls.
+  - Add a `SyncConnection` for the remaining batch uses of `.call_reader()`.
+  - Add a dedicated backup API.
+  - Add a first-party Statement abstraction to allow binding parameters to other clients.
+  - Clean-up a few more overlooked uses and narrow `ToSqlProxy`'s lifetimes.
+- Add a new `refinery` driver using above async `transaction()` API.
+- Use new APIs in `TransactionRecorder` used for migrations.
+- Increase statement cache size.
+- Minor: replace `kanal` with `flume` everywhere.
+- Update dependencies.
+
+## v0.26.4
+
+- Use WASI resources to model WASM transactions more correctly. Also spawn a watcher task that force-unlocks the DB after a deadline for better isolation from user code.
+  - The new APIs are transparent and implemented in a backwards-compatible way, i.e. if you rebuild your WASM guests against future releases of the guest runtimes you'll pick up those changes.
+- Make server limits more configurable: rate limits and body size limits.
+- Add "created" and "last-updated" timestamps to accounts page in admin UI.
+- Switch SQLite execution model from `kanal` to `flume` to allow the writer to lend a hand with reads.
+- Mark read connections as explicitly `query_only`.
+- More work towards untangling from `rusqlite`: remove more uses of leaky abstractions and make error handling generic.
+- Update dependencies.
+
+## v0.26.3
+
+- Make `trailbase-sqlite`'s abstractions less leaky, i.e. don't depend on `rusqlite`'s internals as much. This is a pre-requisite if we wanted to support other drivers and DBs.
+- Fix and clean-up `trailbase-sqlite`'s execution engine.
+- Update clients across all languages to automatically "log out" on token refresh when a 401 (Unauthorized) error is received.
+- Stricter "read-only" query filtering for WASM guests. Sqlean's `SELECT define()` statements are actually mutating. Maybe it's time to remove `sqlean`. It predates JS and WASM components and may have overstayed its welcome.
+- Allow loading `*.wasm` components from symlinks.
+- Tweak `auth-ui`'s profile page to properly clean-up invalid cookie tokens.
+- Fix a few small issues with the blog example.
+- Update dependencies.
+
+## v0.26.2
+
+- Fork the `reactivate` crate to streamline it and make it lock-free. Previously, accessing the config would require claiming an eclusive lock.
+- Remove unsafe query construction from WASM guest examples and add utilities for escaping safe SQL string literals to the guest runtimes.
+- Fix wiring of new `redirect_uri_allowlist` config option.
+
+## v0.26.1
+
+- Add an `redirect_uri_allowlist` config option to enable select off-site auth redirects.
+- Fix escaping of migration file names to work for any unicode characters.
+- Fix escaping of named placeholders to work for any unicode characters.
+- Update Rust and JavaScript dependencies.
+
+## v0.26.0
+
+- Overhaul change subscriptions:
+  - Minimize work done on SQLite's pre-update hook.
+  - Push brokering into separate thread and ACL-checking+filtering into handler tasks.
+  - Simplify locking.
+  - Add layered sequence numbers to track both, server-side event losses (e.g. due to back-pressure) and allow clients to detect client-side losses (e.g. due to unreliable network).
+  - Add structured status to error events. This changes the wire-format and is a breaking change. While this only affects errors, users of change subscriptions should update their client.
+    - We did also explore switching from an externally to an internally tagged union format. However, externally tagged is the way to go for change event schemas with something like JSON schema or Avro.
+  - Update all the clients that support change subscriptions, i.e. all but Swift.
+  - Add stress-tests.
+- Fix `ATTACH DATABASE` calls from WASM guests.
+- Update dependencies.
+
+## v0.25.4
+
+- Fix MacOS release workflows.
+
+## v0.25.3
+
+- Concurrent `SELECT`s for WASM guests.
+  - The guest APIs don't distinguish between reads and writes, hence everything was assumed to be potentially mutating.
+  - We're now "pre-parsing" queries to handle `SELECT`s and `ATTACH/DETACH DATABASE` specially and multiplex to multiple connections.
+- Stricter `Content-Type` handling and some preparations for supporting more encodings. This is part of an exploration to support Avro.
+- Fix JSON schemas for nullable JSON and expanded foreign key columns.
+- Add JSON input/output validation to record APIs in debug builds.
+- Update dependencies.
+
+## v0.25.2
+
+- Update clients for all eight supported language environments to allow injecting custom "transport" implementations.
+  - This can be used for testing but also in prod. For example, a backend may want to inject users' original IPs via `X-Forwarded-For` to make sure logging and rate limiting works correctly.
+- Update JS/TS WASM guest runtime to use canonical jco generated types.
+- Update Rust and JavaScript dependencies including latest Wasmtime & TS6.
+
+## v0.25.1
+
+- Add GitHub OAuth provider (validated).
+- Minor: stable, lexicograpic sorting of OAuth providers.
+- Fix smaller cookie issues and inconsistencies, previously:
+  - `same-site` policy shouldn't depend on dev-mode to avoid inconsitencies and late surprises.
+  - OAuth state cookies were `secure` in dev-mode and not as strict as they could be in prod-mode. Now all cookies `secure` policy depends on dev-mode + HTTPS site.
+  - Empty override-cookies during logout API should not bet `secure`, i.e require TLS.
+- QoL: Trim whitespaces from OAuth client id/secret in UI.
+- Update Rust and JS dependencies (Astro 6, vite 8, ...).
+
 ## v0.25.0
 
 - Add support for TOTP (e.g. authenticator app) two-factor auth: APIs, auth UI and admin UI 🎉.

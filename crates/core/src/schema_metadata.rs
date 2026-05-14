@@ -1,9 +1,12 @@
 use fallible_iterator::FallibleIterator;
 use log::*;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use thiserror::Error;
+use trailbase_extension::jsonschema::JsonSchemaRegistry;
 use trailbase_schema::parse::parse_into_statement;
 use trailbase_schema::sqlite::{Table, View};
-use trailbase_sqlite::params;
+use trailbase_sqlite::{params, unpack_other_error};
 
 pub use trailbase_schema::metadata::{
   ConnectionMetadata, JsonColumnMetadata, JsonSchemaError, TableMetadata,
@@ -13,20 +16,57 @@ use crate::constants::SQLITE_SCHEMA_TABLE;
 
 #[derive(Debug, Error)]
 pub enum SchemaLookupError {
-  #[error("TB SQLite error: {0}")]
+  #[error("SqlError: {0}")]
   Sql(#[from] trailbase_sqlite::Error),
-  #[error("Rusqlite error: {0}")]
-  Rusqlite(#[from] rusqlite::Error),
-  #[error("Rusqlite error: {0}")]
-  FromSql(#[from] rusqlite::types::FromSqlError),
-  #[error("Schema error: {0}")]
+  #[error("FromSqlError: {0}")]
+  FromSql(#[from] trailbase_sqlite::from_sql::FromSqlError),
+  #[error("SchemaError: {0}")]
   Schema(#[from] trailbase_schema::sqlite::SchemaError),
-  #[error("Missing")]
-  Missing,
-  #[error("Sql parse error: {0}")]
+  #[error("InvalidSqlStatement")]
+  InvalidSqlStatement,
+  #[error("QueryReturnedNoRows")]
+  QueryReturnedNoRows,
+  #[error("SqlParseError: {0}")]
   SqlParse(#[from] sqlite3_parser::lexer::sql::Error),
-  #[error("Other error: {0}")]
-  Other(Box<dyn std::error::Error + Send + Sync>),
+  #[error("JsonSchemaError: {0}")]
+  JsonSchema(#[from] trailbase_schema::metadata::JsonSchemaError),
+}
+
+pub(crate) async fn build_metadata(
+  conn: &trailbase_sqlite::Connection,
+  json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
+) -> Result<ConnectionMetadata, SchemaLookupError> {
+  let json_schema_registry = json_schema_registry.clone();
+
+  return conn
+    .call_writer(move |mut conn| -> Result<_, trailbase_sqlite::Error> {
+      // Nested impl just for packaging error.
+      fn build_metadata_impl(
+        conn: &mut trailbase_sqlite::SyncConnection,
+        json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
+      ) -> Result<ConnectionMetadata, SchemaLookupError> {
+        let tables = lookup_and_parse_all_table_schemas(conn)?;
+        let views = lookup_and_parse_all_view_schemas(conn, &tables)?;
+
+        return build_connection_metadata_and_install_file_deletion_triggers(
+          conn,
+          tables,
+          views,
+          json_schema_registry,
+        );
+      }
+
+      return build_metadata_impl(&mut conn, &json_schema_registry)
+        .map_err(|err| trailbase_sqlite::Error::Other(err.into()));
+    })
+    .await
+    .map_err(|err| {
+      // Unpack potentially packed SchemaLookupErrors.
+      return match unpack_other_error::<SchemaLookupError>(err) {
+        Ok(schema_lookup_err) => schema_lookup_err,
+        Err(sql_err) => sql_err.into(),
+      };
+    });
 }
 
 pub async fn lookup_and_parse_table_schema(
@@ -36,19 +76,19 @@ pub async fn lookup_and_parse_table_schema(
 ) -> Result<Table, SchemaLookupError> {
   // Then get the actual table.
   let sql: String = conn
-    .read_query_row_f(
+    .read_query_row_get(
       format!(
-        "SELECT sql FROM {db}.{SQLITE_SCHEMA_TABLE} WHERE type = 'table' AND name = $1",
+        "SELECT sql FROM '{db}'.{SQLITE_SCHEMA_TABLE} WHERE type = 'table' AND name = $1",
         db = database.unwrap_or("main")
       ),
       params!(table_name.to_string()),
-      |row| row.get(0),
+      0,
     )
     .await?
-    .ok_or_else(|| trailbase_sqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows))?;
+    .ok_or(SchemaLookupError::QueryReturnedNoRows)?;
 
   let Some(stmt) = parse_into_statement(&sql)? else {
-    return Err(SchemaLookupError::Missing);
+    return Err(SchemaLookupError::InvalidSqlStatement);
   };
 
   let mut table: Table = stmt.try_into()?;
@@ -58,24 +98,90 @@ pub async fn lookup_and_parse_table_schema(
   return Ok(table);
 }
 
-pub fn lookup_and_parse_all_table_schemas_sync(
-  conn: &rusqlite::Connection,
+/// (Re-)build the connections schema representation *with* the side-effect of (re-)installing file
+/// deletion triggers.
+///
+/// Tying the construction of schema metadata and the (re-)installing of file deletion triggers so
+/// closely together is a necessary evil. For example, whenever a schema changes, e.g. a new file
+/// column is added, we need to rebuild the metadata and update or install missing triggers.
+fn build_connection_metadata_and_install_file_deletion_triggers(
+  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
+  tables: Vec<Table>,
+  views: Vec<View>,
+  registry: &RwLock<JsonSchemaRegistry>,
+) -> Result<ConnectionMetadata, SchemaLookupError> {
+  let metadata = ConnectionMetadata::from_schemas(tables, views, &registry.read())?;
+
+  setup_file_deletion_triggers(conn, &metadata)?;
+
+  return Ok(metadata);
+}
+
+// Install file column triggers. This ain't pretty, this might be better on construction and
+// schema changes.
+fn setup_file_deletion_triggers(
+  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
+  metadata: &ConnectionMetadata,
+) -> Result<(), trailbase_sqlite::Error> {
+  for metadata in metadata.tables.values() {
+    for column_meta in &metadata.column_metadata {
+      if !column_meta.is_file {
+        continue;
+      }
+
+      let table_name = &metadata.schema.name;
+      let unqualified_name = &metadata.schema.name.name;
+      let db = metadata
+        .schema
+        .name
+        .database_schema
+        .as_deref()
+        .unwrap_or("main");
+
+      let column_name = &column_meta.column.name;
+
+      conn.execute_batch(format!(
+          "\
+          DROP TRIGGER IF EXISTS '{db}'.'__{unqualified_name}__{column_name}__update_trigger'; \
+          CREATE TRIGGER IF NOT EXISTS '{db}'.'__{unqualified_name}__{column_name}__update_trigger' AFTER UPDATE ON {table_name} \
+            WHEN OLD.\"{column_name}\" IS NOT NULL AND OLD.\"{column_name}\" != NEW.\"{column_name}\" \
+            BEGIN \
+              INSERT INTO _file_deletions (table_name, record_rowid, column_name, json) VALUES \
+                ('{table_name}', OLD._rowid_, '{column_name}', OLD.\"{column_name}\"); \
+            END; \
+          \
+          DROP TRIGGER IF EXISTS '{db}'.'__{unqualified_name}__{column_name}__delete_trigger'; \
+          CREATE TRIGGER IF NOT EXISTS '{db}'.'__{unqualified_name}__{column_name}__delete_trigger' AFTER DELETE ON {table_name} \
+            WHEN OLD.\"{column_name}\" IS NOT NULL \
+            BEGIN \
+              INSERT INTO _file_deletions (table_name, record_rowid, column_name, json) VALUES \
+                ('{table_name}', OLD._rowid_, '{column_name}', OLD.\"{column_name}\"); \
+            END; \
+          ",
+          table_name = table_name.escaped_string(),
+        ))?;
+    }
+  }
+
+  return Ok(());
+}
+
+fn lookup_and_parse_all_table_schemas(
+  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
 ) -> Result<Vec<Table>, SchemaLookupError> {
-  let databases = trailbase_sqlite::connection::list_databases(conn)?;
+  let databases = list_databases(conn)?;
 
   let mut tables: Vec<Table> = vec![];
   for db in databases {
-    // Then get the actual tables.
-    let mut stmt = conn.prepare(&format!(
-      "SELECT sql FROM {db}.{SQLITE_SCHEMA_TABLE} WHERE type = 'table'",
+    let query = format!(
+      "SELECT sql FROM '{db}'.{SQLITE_SCHEMA_TABLE} WHERE type = 'table'",
       db = db.name
-    ))?;
-    let mut rows = stmt.raw_query();
+    );
 
-    while let Some(row) = rows.next()? {
+    for row in conn.query_rows(&query, ())? {
       let sql: String = row.get(0)?;
       let Some(stmt) = parse_into_statement(&sql)? else {
-        return Err(SchemaLookupError::Missing);
+        return Err(SchemaLookupError::InvalidSqlStatement);
       };
       tables.push({
         let mut table: Table = stmt.try_into()?;
@@ -88,35 +194,21 @@ pub fn lookup_and_parse_all_table_schemas_sync(
   return Ok(tables);
 }
 
-fn sqlite3_parse_view(sql: &str, tables: &[Table]) -> Result<View, SchemaLookupError> {
-  let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
-  match parser.next()? {
-    None => Err(SchemaLookupError::Missing),
-    Some(cmd) => {
-      use sqlite3_parser::ast::Cmd;
-      match cmd {
-        Cmd::Stmt(stmt) => Ok(View::from(stmt, tables)?),
-        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(SchemaLookupError::Missing),
-      }
-    }
-  }
-}
-
-pub fn lookup_and_parse_all_view_schemas_sync(
-  conn: &rusqlite::Connection,
+fn lookup_and_parse_all_view_schemas(
+  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
   tables: &[Table],
 ) -> Result<Vec<View>, SchemaLookupError> {
-  let databases = trailbase_sqlite::connection::list_databases(conn)?;
+  let databases = list_databases(conn)?;
 
   let mut views: Vec<View> = vec![];
   for db in databases {
     // Then get the actual views.
-    let mut stmt = conn.prepare(&format!(
-      "SELECT sql FROM {SQLITE_SCHEMA_TABLE} WHERE type = 'view'"
-    ))?;
-    let mut rows = stmt.raw_query();
+    let query = format!(
+      "SELECT sql FROM '{db}'.{SQLITE_SCHEMA_TABLE} WHERE type = 'view'",
+      db = db.name
+    );
 
-    while let Some(row) = rows.next()? {
+    for row in conn.query_rows(&query, ())? {
       let sql: String = row.get(0)?;
       match sqlite3_parse_view(&sql, tables) {
         Ok(mut view) => {
@@ -131,6 +223,36 @@ pub fn lookup_and_parse_all_view_schemas_sync(
   }
 
   return Ok(views);
+}
+
+fn sqlite3_parse_view(sql: &str, tables: &[Table]) -> Result<View, SchemaLookupError> {
+  let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
+  match parser.next()? {
+    None => Err(SchemaLookupError::InvalidSqlStatement),
+    Some(cmd) => {
+      use sqlite3_parser::ast::Cmd;
+      match cmd {
+        Cmd::Stmt(stmt) => Ok(View::from(stmt, tables)?),
+        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(SchemaLookupError::InvalidSqlStatement),
+      }
+    }
+  }
+}
+
+fn list_databases(
+  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
+) -> Result<Vec<trailbase_sqlite::Database>, trailbase_sqlite::Error> {
+  let rows = conn.query_rows("SELECT seq, name FROM pragma_database_list", ())?;
+
+  return rows
+    .iter()
+    .map(|row| {
+      return Ok(trailbase_sqlite::Database {
+        seq: row.get(0)?,
+        name: row.get(1)?,
+      });
+    })
+    .collect::<Result<Vec<_>, _>>();
 }
 
 #[cfg(test)]
@@ -228,29 +350,25 @@ mod tests {
       } = state.connection_manager().main_entry();
 
       conn
-        .execute(
-          "CREATE TABLE foreign_table (id INTEGER PRIMARY KEY) STRICT",
-          (),
-        )
-        .await
-        .unwrap();
+        .execute_batch(format!(
+          "
+            CREATE TABLE foreign_table (id INTEGER PRIMARY KEY) STRICT;
 
-      conn
-        .execute(
-          format!(
-            r#"CREATE TABLE {table_name} (
-            id INTEGER PRIMARY KEY,
-            fk INTEGER REFERENCES foreign_table(id)
-          ) STRICT"#,
-            table_name = table_name.escaped_string(),
-          ),
-          (),
-        )
+            CREATE TABLE {table_name} (
+              id       INTEGER PRIMARY KEY,
+              fk       INTEGER NOT NULL REFERENCES foreign_table(id),
+              fk_null  INTEGER REFERENCES foreign_table(id)
+            ) STRICT;
+          ",
+          table_name = table_name.escaped_string(),
+        ))
         .await
         .unwrap();
 
       state.rebuild_connection_metadata().await.unwrap();
     }
+
+    let expanded_cols = vec!["fk", "fk_null"];
 
     add_record_api_config(
       &state,
@@ -258,7 +376,7 @@ mod tests {
         name: Some("test_table_api".to_string()),
         table_name: Some(table_name.name.clone()),
         acl_world: [PermissionFlag::Create as i32, PermissionFlag::Read as i32].into(),
-        expand: vec!["fk".to_string()],
+        expand: expanded_cols.iter().map(|c| c.to_string()).collect(),
         ..Default::default()
       },
     )
@@ -279,7 +397,7 @@ mod tests {
       JsonSchemaMode::Select,
       Some(Expand {
         tables: &metadata.tables.values().collect::<Vec<_>>(),
-        foreign_key_columns: vec!["foreign_table"],
+        foreign_key_columns: expanded_cols,
       }),
     )
     .unwrap();
@@ -292,12 +410,28 @@ mod tests {
         "type": "object",
         "properties": {
           "id": { "type": "integer" },
-          "fk": { "$ref": "#/$defs/foreign_table" },
+          "fk": { "$ref": "#/$defs/test_table.fk" },
+          "fk_null": { "$ref": "#/$defs/test_table.fk_null" },
         },
-        "required": ["id"],
+        "required": ["id", "fk"],
         "$defs": {
-          "foreign_table": {
+          "test_table.fk": {
             "type": "object",
+            "properties": {
+              "id" : { "type": "integer"},
+              "data": {
+                "title": "foreign_table",
+                "type": "object",
+                "properties": {
+                  "id" : { "type": "integer" },
+                },
+                "required": ["id"],
+              },
+            },
+            "required": ["id"],
+          },
+          "test_table.fk_null": {
+            "type": ["null", "object"],
             "properties": {
               "id" : { "type": "integer"},
               "data": {
@@ -361,13 +495,14 @@ mod tests {
     {
       let expected = json!({
         "id": 1,
-        "fk":{ "id": 1 },
+        "fk": { "id": 1 },
+        "fk_null": null,
       });
 
       let Json(value) = read_record_handler(
         State(state.clone()),
         Path(("test_table_api".to_string(), "1".to_string())),
-        Query(ReadRecordQuery::default()),
+        Query(ReadRecordQuery { expand: None }),
         None,
       )
       .await
@@ -403,6 +538,7 @@ mod tests {
           "id": 1,
         },
       },
+      "fk_null": null,
     });
 
     {

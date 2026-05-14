@@ -1,5 +1,4 @@
 use askama::Template;
-use log::*;
 use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -9,12 +8,13 @@ use trailbase_schema::metadata::{
   find_user_id_foreign_key_columns,
 };
 use trailbase_schema::{QualifiedName, QualifiedNameEscaped};
-use trailbase_sqlite::{Connection, NamedParams, Params as _, Value};
+use trailbase_sqlite::{Connection, NamedParams, SyncConnectionTrait, Value};
 
 use crate::auth::user::User;
 use crate::config::proto::{ConflictResolutionStrategy, RecordApiConfig};
 use crate::constants::USER_TABLE;
-use crate::records::params::{LazyParams, Params, prefix_colon};
+use crate::records::params::{LazyParams, Params};
+use crate::records::util::named_placeholder;
 use crate::records::{Permission, RecordError};
 
 #[derive(Clone)]
@@ -45,7 +45,8 @@ struct RecordApiSchema {
   column_name_to_index: HashMap<String, usize>,
 }
 
-type DeferredAclCheck = dyn (FnOnce(&rusqlite::Connection) -> Result<(), RecordError>) + Send;
+// type DeferredAclCheck<T: SyncConnectionTrait> =
+//   Box<dyn (FnOnce(&T) -> Result<(), RecordError>) + Send>;
 
 impl RecordApiSchema {
   fn from_table(table_metadata: &TableMetadata, config: &RecordApiConfig) -> Result<Self, String> {
@@ -70,7 +71,7 @@ impl RecordApiSchema {
       .iter()
       .map(|meta| {
         (
-          Cow::Owned(prefix_colon(&meta.column.name)),
+          Cow::Owned(named_placeholder(&meta.column.name)),
           trailbase_sqlite::Value::Null,
         )
       })
@@ -374,15 +375,14 @@ impl RecordApi {
     return self.state.metadata.read().clone();
   }
 
-  pub(crate) fn rebuild_connection_metadata(
+  pub(crate) async fn rebuild_connection_metadata(
     &self,
     json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
-  ) {
-    if let Ok(metadata) =
-      crate::connection::build_metadata(&self.state.conn.write_lock(), json_schema_registry)
-    {
-      *self.state.metadata.write() = Arc::new(metadata);
-    }
+  ) -> Result<(), crate::connection::ConnectionError> {
+    let metadata =
+      crate::schema_metadata::build_metadata(&self.state.conn, json_schema_registry).await?;
+    *self.state.metadata.write() = Arc::new(metadata);
+    return Ok(());
   }
 
   #[inline]
@@ -474,130 +474,95 @@ impl RecordApi {
       return Ok(());
     };
 
-    let params = self.build_named_params(p, record_id, request_params, user)?;
-
-    // NOTE: Avoid slushing between sqlite threads with regard to an allowed follow-on action.
-    let allowed_result = match p {
-      Permission::Read | Permission::Schema => {
-        self
-          .state
-          .conn
-          .call_reader(move |conn| {
-            Ok(Self::check_record_level_access_impl(
-              conn,
-              &access_query,
-              params,
-            )?)
-          })
-          .await
-      }
-      _ => {
-        self
-          .state
-          .conn
-          .call(move |conn| {
-            Ok(Self::check_record_level_access_impl(
-              conn,
-              &access_query,
-              params,
-            )?)
-          })
-          .await
-      }
-    };
-
-    match allowed_result {
-      Ok(allowed) => {
-        if allowed {
-          return Ok(());
-        }
-      }
-      Err(err) => {
-        warn!("RLA query failed: {err}");
-
-        #[cfg(test)]
-        panic!("RLA query failed: {err}");
-      }
-    };
+    if self
+      .check_record_level_access_impl(
+        access_query,
+        self.build_named_params(p, record_id, request_params, user)?,
+      )
+      .await
+    {
+      return Ok(());
+    }
 
     return Err(RecordError::Forbidden);
   }
 
-  pub fn build_record_level_access_check(
+  pub fn record_level_access_check<T: SyncConnectionTrait>(
     &self,
+    conn: &mut T,
     p: Permission,
     record_id: Option<&Value>,
     request_params: Option<&mut LazyParams<'_>>,
     user: Option<&User>,
-  ) -> Result<Box<DeferredAclCheck>, RecordError> {
+  ) -> Result<(), RecordError> {
     // First check table level access and if present check row-level access based on access rule.
     self.check_table_level_access(p, user)?;
 
     let Some(access_query) = self.state.cached_access_query(p) else {
-      return Ok(Box::new(|_conn| Ok(())));
+      return Ok(());
     };
 
     let params = self.build_named_params(p, record_id, request_params, user)?;
 
-    return Ok(Box::new(move |conn| {
-      return match Self::check_record_level_access_impl(conn, &access_query, params) {
-        Ok(allowed) if allowed => Ok(()),
-        _ => Err(RecordError::Forbidden),
-      };
-    }));
+    return match conn
+      .query_row(access_query, params)
+      .ok()
+      .and_then(|row| row.and_then(|r| r.get::<bool>(0).ok()))
+    {
+      Some(allowed) if allowed => Ok(()),
+      _ => Err(RecordError::Forbidden),
+    };
   }
 
   #[inline]
-  fn check_record_level_access_impl(
-    conn: &rusqlite::Connection,
-    query: &str,
-    named_params: NamedParams,
-  ) -> Result<bool, rusqlite::Error> {
-    let mut stmt = conn.prepare_cached(query)?;
-    named_params.bind(&mut stmt)?;
+  async fn check_record_level_access_impl(
+    &self,
+    query: impl AsRef<str> + Send + 'static,
+    params: impl trailbase_sqlite::Params + Send + 'static,
+  ) -> bool {
+    return match self.state.conn.read_query_row_get(query, params, 0).await {
+      Ok(Some(allowed)) => allowed,
+      Ok(None) => {
+        debug_assert!(false, "RLA query returned no result");
 
-    if let Some(row) = stmt.raw_query().next()? {
-      return row.get(0);
-    }
-    return Err(rusqlite::Error::QueryReturnedNoRows);
+        false
+      }
+      Err(err) => {
+        debug_assert!(false, "RLA query failed: {err}");
+
+        false
+      }
+    };
   }
 
   /// Check if the given user (if any) can access a record given the request and the operation.
+  ///
+  /// QUESTION: Could we structure this in a way that we yield less in case there's no read-access
+  /// rule, e.g. sync and return (yikes):
+  ///   `Result<Option<Box<dyn Future<Output=Result<(), RecordError>>>>, RecordErrorr>`
   #[inline]
-  pub(crate) fn check_record_level_read_access_for_subscriptions(
+  pub(crate) async fn check_record_level_read_access_for_subscriptions(
     &self,
-    conn: &rusqlite::Connection,
-    params: SubscriptionAclParams<'_>,
+    record: &Arc<indexmap::IndexMap<String, trailbase_sqlite::Value>>,
+    user: Option<&User>,
   ) -> Result<(), RecordError> {
     // First check table level access and if present check row-level access based on access rule.
-    self.check_table_level_access(Permission::Read, params.user)?;
+    self.check_table_level_access(Permission::Read, user)?;
 
     let Some(ref access_query) = self.state.subscription_read_access_query else {
       return Ok(());
     };
 
-    let mut stmt = conn
-      .prepare_cached(access_query)
-      .map_err(|_err| RecordError::Forbidden)?;
+    let params = SubscriptionAclParams {
+      params: record.clone(),
+      user: user.cloned(),
+    };
 
-    // NOTE: the `bind` impl does the heavy lifting.
-    params
-      .bind(&mut stmt)
-      .map_err(|_err| RecordError::Forbidden)?;
-
-    match stmt.raw_query().next() {
-      Ok(Some(row)) => {
-        if row.get(0).unwrap_or(false) {
-          return Ok(());
-        }
-      }
-      Ok(None) => {}
-      Err(err) => {
-        warn!("RLA query failed: {err}");
-
-        #[cfg(test)]
-        panic!("RLA query failed: {err}");
-      }
+    if self
+      .check_record_level_access_impl(access_query.clone(), params)
+      .await
+    {
+      return Ok(());
     }
 
     return Err(RecordError::Forbidden);
@@ -704,23 +669,26 @@ impl RecordApi {
   }
 }
 
-pub(crate) struct SubscriptionAclParams<'a> {
-  pub params: &'a indexmap::IndexMap<&'a str, rusqlite::types::Value>,
-  pub user: Option<&'a User>,
+struct SubscriptionAclParams {
+  params: Arc<indexmap::IndexMap<String, trailbase_sqlite::Value>>,
+  user: Option<User>,
 }
 
-impl<'a> trailbase_sqlite::Params for SubscriptionAclParams<'a> {
-  fn bind(self, stmt: &mut rusqlite::Statement<'_>) -> rusqlite::Result<()> {
-    for (name, v) in self.params {
-      if let Some(idx) = stmt.parameter_index(&prefix_colon(name))? {
-        stmt.raw_bind_parameter(idx, v)?;
+impl trailbase_sqlite::Params for SubscriptionAclParams {
+  fn bind<S: trailbase_sqlite::Statement>(
+    self,
+    stmt: &mut S,
+  ) -> Result<(), trailbase_sqlite::Error> {
+    for (name, v) in self.params.iter() {
+      if let Some(idx) = stmt.parameter_index(&named_placeholder(name))? {
+        stmt.bind_parameter(idx, v.into())?;
       };
     }
 
     if let Some(user) = self.user
       && let Some(idx) = stmt.parameter_index(":__user_id")?
     {
-      stmt.raw_bind_parameter(idx, rusqlite::types::Value::Blob(user.uuid.into()))?;
+      stmt.bind_parameter(idx, trailbase_sqlite::Value::Blob(user.uuid.into()).into())?;
     }
 
     return Ok(());

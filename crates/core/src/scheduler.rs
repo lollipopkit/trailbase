@@ -16,7 +16,7 @@ use trailbase_sqlite::{Connection, params};
 
 use crate::DataDir;
 use crate::config::proto::{Config, SystemJob, SystemJobId};
-use crate::connection::ConnectionManager;
+use crate::connection::{BuildOptions, ConnectionManager};
 use crate::constants::{
   AUTHORIZATION_CODE_TABLE, LOGS_RETENTION_DEFAULT, OTP_CODE_TABLE, SESSION_TABLE,
 };
@@ -270,20 +270,10 @@ fn build_job(
         },
         callback: build_callback(move || {
           let conn = main_conn.clone();
-          let backup_file = backup_file.clone();
-
+          let path = backup_file.clone();
           return async move {
-            conn
-              .call(|conn| {
-                return Ok(conn.backup("main", backup_file, /* progress= */ None)?);
-              })
-              .await
-              .map_err(|err| {
-                error!("Backup failed: {err}");
-                err
-              })?;
-
-            Ok::<(), trailbase_sqlite::Error>(())
+            conn.backup(path).await?;
+            return Ok::<(), trailbase_sqlite::Error>(());
           };
         }),
       }
@@ -413,8 +403,13 @@ fn build_job(
                 let conn = match db_name.as_str() {
                   "main" => connection_manager.main_entry().connection,
                   name => {
-                    let Ok(entry) =
-                      connection_manager.get_entry(false, Some([name.to_string()].into()))
+                    let Ok(entry) = connection_manager
+                      .get_entry(BuildOptions {
+                        is_main: false,
+                        attached_databases: Some([name.to_string()].into()),
+                        num_threads: Some(1),
+                      })
+                      .await
                     else {
                       continue;
                     };
@@ -564,7 +559,7 @@ mod tests {
     // night).
     let registry = JobRegistry::new();
 
-    let (sender, receiver) = async_channel::unbounded::<()>();
+    let (sender, receiver) = flume::unbounded::<()>();
 
     //               sec  min   hour   day of month   month   day of week  year
     let expression = "*    *     *         *            *         *         *";
@@ -576,7 +571,7 @@ mod tests {
         build_callback(move || {
           let sender = sender.clone();
           return async move {
-            sender.send(()).await.unwrap();
+            sender.send_async(()).await.unwrap();
             Err("result")
           };
         }),
@@ -585,7 +580,7 @@ mod tests {
 
     job.start();
 
-    receiver.recv().await.unwrap();
+    receiver.recv_async().await.unwrap();
 
     let jobs = registry.jobs.lock();
     let first = jobs.keys().next().unwrap();

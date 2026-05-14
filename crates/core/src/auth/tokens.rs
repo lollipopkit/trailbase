@@ -105,12 +105,7 @@ pub(crate) async fn extract_tokens_from_request_parts(
         return AuthError::Internal(err.into());
       })?;
 
-      cookies.add(new_cookie(
-        COOKIE_AUTH_TOKEN,
-        new_auth_token,
-        ttl,
-        state.dev_mode(),
-      ));
+      cookies.add(new_cookie(state, COOKIE_AUTH_TOKEN, new_auth_token, ttl));
 
       return Ok(Tokens {
         auth_token_claims: claims,
@@ -224,9 +219,7 @@ pub(crate) async fn reauth_with_refresh_token(
 
   let Some(user_id) = state
     .session_conn()
-    .query_row_f(SESSION_QUERY, params!(refresh_token), |row| {
-      row.get::<_, [u8; 16]>(0)
-    })
+    .read_query_row_get::<[u8; 16]>(SESSION_QUERY, params!(refresh_token), 0)
     .await?
   else {
     // Row not found case, typically expected in one of 4 cases:
@@ -240,7 +233,7 @@ pub(crate) async fn reauth_with_refresh_token(
     return Err(AuthError::Unauthorized);
   };
 
-  const USER_QUERY: &str = formatcp!("SELECT * FROM '{USER_TABLE}' WHERE id = $1");
+  const USER_QUERY: &str = formatcp!(r#"SELECT * FROM "{USER_TABLE}" WHERE id = $1"#);
 
   let Some(db_user) = state
     .user_conn()

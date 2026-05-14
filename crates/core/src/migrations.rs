@@ -45,14 +45,19 @@ pub(crate) fn new_migration_runner(migrations: &[Migration]) -> trailbase_refine
 ///
 /// Returns true, if V1 was applied, i.e. DB is initialized for the first time,
 /// otherwise false.
-pub(crate) fn apply_main_migrations(
-  conn: &mut rusqlite::Connection,
+pub(crate) async fn apply_main_migrations(
+  conn: &trailbase_sqlite::Connection,
   base_migrations_path: Option<impl AsRef<Path>>,
 ) -> Result<bool, RefineryError> {
+  #[cfg(feature = "pg")]
+  let mut migrations = vec![load_embedded_migrations::<PgMainMigrations>()];
+
+  #[cfg(not(feature = "pg"))]
   let mut migrations = vec![
     load_embedded_migrations::<BaseMigrations>(),
     load_embedded_migrations::<MainMigrations>(),
   ];
+
   if let Some(path) = base_migrations_path {
     // Ignore when `<traildepot>/migrations/main/` is missing.
     migrations.push(maybe_load_sql_migrations(path.as_ref().join("main"), true)?);
@@ -60,7 +65,8 @@ pub(crate) fn apply_main_migrations(
     // Legacy: all *.sql files in migrations.
     migrations.push(load_sql_migrations(path, false)?);
   }
-  return apply_migrations("main", conn, migrations);
+
+  return apply_migrations_async("main", conn, migrations).await;
 }
 
 // Base migrations contains things like file deletions table shared across main and user DBs.
@@ -109,6 +115,29 @@ pub(crate) fn apply_migrations(
 
   let runner = new_migration_runner(&migrations);
   let report = runner.run(conn).map_err(|err| {
+    error!("Migration error for '{name}' DB: {err}");
+    return err;
+  })?;
+
+  let applied_migrations = report.applied_migrations();
+  log_migrations(name, applied_migrations);
+
+  // If we applied migration v1 we can be sure this is a fresh database.
+  let new_db = applied_migrations.iter().any(|m| m.version() == 1);
+
+  return Ok(new_db);
+}
+
+pub(crate) async fn apply_migrations_async(
+  name: &str,
+  conn: &trailbase_sqlite::Connection,
+  migrations: Vec<Vec<Migration>>,
+) -> Result<bool, RefineryError> {
+  let migrations: Vec<Migration> = migrations.into_iter().flatten().sorted().collect();
+
+  let mut conn = conn.clone();
+  let runner = new_migration_runner(&migrations);
+  let report = runner.run_async(&mut conn).await.map_err(|err| {
     error!("Migration error for '{name}' DB: {err}");
     return err;
   })?;
@@ -276,6 +305,11 @@ struct BaseMigrations;
 #[folder = "migrations/main"]
 struct MainMigrations;
 
+#[cfg(feature = "pg")]
+#[derive(Clone, rust_embed::RustEmbed)]
+#[folder = "migrations/pg_main"]
+struct PgMainMigrations;
+
 #[derive(Clone, rust_embed::RustEmbed)]
 #[folder = "migrations/logs"]
 struct LogsMigrations;
@@ -287,6 +321,8 @@ struct SessionMigrations;
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  use trailbase_sqlite::Connection;
 
   #[test]
   fn test_load_sql_migrations() {
@@ -302,41 +338,34 @@ mod tests {
   async fn test_schema_invariants_still_hold_after_migrations() {
     let state = crate::app_state::test_state(None).await.unwrap();
 
-    fn exists(conn: &rusqlite::Connection, name: &str, schema_type: &str) -> bool {
-      return conn
-        .query_one(
-          &format!(
+    async fn exists(conn: &Connection, name: &str, schema_type: &str) -> bool {
+      return conn.read_query_row_get(
+          format!(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = '{schema_type}' AND name = '{name}')"
           ),
           (),
-          |row| row.get(0),
+          0,
         )
-        .unwrap_or_default();
+        .await.unwrap().unwrap();
     }
 
-    fn index_exists(conn: &rusqlite::Connection, name: &str) -> bool {
-      return exists(conn, name, "index");
+    async fn index_exists(conn: &Connection, name: &str) -> bool {
+      return exists(conn, name, "index").await;
     }
 
-    fn trigger_exists(conn: &rusqlite::Connection, name: &str) -> bool {
-      return exists(conn, name, "trigger");
+    async fn trigger_exists(conn: &Connection, name: &str) -> bool {
+      return exists(conn, name, "trigger").await;
     }
 
-    state
-      .conn()
-      .call(|conn| {
-        // QUESTION: Should we push something like this down into startup to assert that
-        // user-provided migrations don't break TB's expectations, e.g. they modified the
-        // `_user` TABLE and forgot to put an index back into place.
-        assert!(index_exists(conn, "__user__email_index"));
-        assert!(index_exists(conn, "__user__provider_ids_index"));
+    let conn = state.conn();
 
-        assert!(trigger_exists(conn, "__user__updated_trigger"));
-        assert!(trigger_exists(conn, "__user_avatar__updated_trigger"));
+    // QUESTION: Should we push something like this down into startup to assert that
+    // user-provided migrations don't break TB's expectations, e.g. they modified the
+    // `_user` TABLE and forgot to put an index back into place.
+    assert!(index_exists(conn, "__user__email_index").await);
+    assert!(index_exists(conn, "__user__provider_ids_index").await);
 
-        return Ok(());
-      })
-      .await
-      .unwrap();
+    assert!(trigger_exists(conn, "__user__updated_trigger").await);
+    assert!(trigger_exists(conn, "__user_avatar__updated_trigger").await);
   }
 }

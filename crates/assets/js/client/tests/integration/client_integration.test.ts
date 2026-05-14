@@ -6,51 +6,32 @@ import { FeatureCollection } from "geojson";
 import { generate } from "otplib";
 
 import {
-  exportedForTesting,
+  exportedForTesting as indexExportForTesting,
   FetchError,
   filePath,
   filesPath,
   initClient,
   urlSafeBase64Encode,
 } from "../../src/index";
-import type { Client, Event, RecordApiImpl } from "../../src/index";
-import { ADDRESS, USE_WS } from "../constants";
+import type {
+  ChangeDeleteEvent,
+  ChangeInsertEvent,
+  ChangeUpdateEvent,
+  Client,
+  Event,
+} from "../../src/index";
 
-const { base64Encode, subscribeWs } = exportedForTesting!;
+import { serverAddress, connect } from "../setup";
+import {
+  SimpleStrict,
+  SimpleSubsetView,
+  SimpleCompleteView,
+  NewSimpleStrict,
+} from "../simple_strict";
+
+const { base64Encode } = indexExportForTesting!;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-type SimpleStrict = {
-  id: string;
-
-  text_null?: string;
-  text_default: string;
-  text_not_null: string;
-
-  int_null?: bigint;
-  int_default: bigint;
-  int_not_null: bigint;
-
-  // Add or generate missing fields.
-};
-
-type NewSimpleStrict = Partial<SimpleStrict>;
-
-type SimpleCompleteView = SimpleStrict;
-
-type SimpleSubsetView = {
-  id: string;
-
-  t_null?: string;
-  t_default?: string;
-  t_not_null: string;
-};
-
-async function connect(): Promise<Client> {
-  const client = initClient(`http://${ADDRESS}`);
-  await client.login("admin@localhost", "secret");
-  return client;
-}
 
 // WARN: this test is not hermetic. I requires an appropriate TrailBase instance to be running.
 test("Auth integration tests", async () => {
@@ -71,16 +52,20 @@ test("Auth integration tests", async () => {
   expect(headers0["Content-Type"]).toBeUndefined();
   expect(headers0["Authorization"].startsWith("Bearer ")).toBe(true);
 
+  await client.refreshAuthToken({ force: true });
+
   expect(await client.logout()).toBe(true);
   expect(client.user()).toBe(undefined);
+  expect(client.tokens()).toBe(undefined);
+
+  await client.refreshAuthToken();
 
   const headers1 = client.headers();
-
   expect(headers1["Authorization"]).toBeUndefined();
 });
 
 test("Multi-factor auth integration tests", async () => {
-  const client = initClient(`http://${ADDRESS}`);
+  const client = initClient(`http://${serverAddress()}`);
   const mfaToken = await client.login("alice@trailbase.io", "secret");
   expect(mfaToken).not.toBeUndefined();
 
@@ -214,7 +199,7 @@ test("Record integration tests", async () => {
 
   await api.delete(ids[1]);
 
-  await expect(async () => await api.read(ids[1])).rejects.toThrowError(
+  await expect(async () => await api.read(ids[1])).rejects.toThrow(
     expect.objectContaining({
       status: status.NOT_FOUND,
     }),
@@ -223,7 +208,7 @@ test("Record integration tests", async () => {
   expect(await client.logout()).toBe(true);
   expect(client.user()).toBe(undefined);
 
-  await expect(async () => await api.read(ids[0])).rejects.toThrowError(
+  await expect(async () => await api.read(ids[0])).rejects.toThrow(
     expect.objectContaining({
       status: status.FORBIDDEN,
     }),
@@ -375,11 +360,11 @@ test("API Errors", async () => {
 
   await expect(
     async () => await client.fetch("/nonexistent/api/path"),
-  ).rejects.toThrowError(
+  ).rejects.toThrow(
     new FetchError(
       status.NOT_FOUND,
       "Not Found",
-      new URL(`http://${ADDRESS}/nonexistent/api/path`),
+      new URL(`http://${serverAddress()}/nonexistent/api/path`),
     ),
   );
 
@@ -387,33 +372,35 @@ test("API Errors", async () => {
   const nonExistentApi = client.records("non-existent");
   await expect(
     async () => await nonExistentApi.read(nonExistentId),
-  ).rejects.toThrowError(
+  ).rejects.toThrow(
     new FetchError(
       status.METHOD_NOT_ALLOWED,
       "Method Not Allowed",
-      new URL(`http://${ADDRESS}/api/records/v1/non-existent/${nonExistentId}`),
+      new URL(
+        `http://${serverAddress()}/api/records/v1/non-existent/${nonExistentId}`,
+      ),
     ),
   );
 
   const api = client.records("simple_strict_table");
   const invalidId = "InvalidId0123";
-  await expect(async () => await api.read(invalidId)).rejects.toThrowError(
+  await expect(async () => await api.read(invalidId)).rejects.toThrow(
     new FetchError(
       status.BAD_REQUEST,
       // Custom error reply by RecordError's IntoResponse impl.
       "Invalid id",
       new URL(
-        `http://${ADDRESS}/api/records/v1/simple_strict_table/${invalidId}`,
+        `http://${serverAddress()}/api/records/v1/simple_strict_table/${invalidId}`,
       ),
     ),
   );
 
-  await expect(async () => await api.read(nonExistentId)).rejects.toThrowError(
+  await expect(async () => await api.read(nonExistentId)).rejects.toThrow(
     new FetchError(
       status.NOT_FOUND,
       "Not Found",
       new URL(
-        `http://${ADDRESS}/api/records/v1/simple_strict_table/${nonExistentId}`,
+        `http://${serverAddress()}/api/records/v1/simple_strict_table/${nonExistentId}`,
       ),
     ),
   );
@@ -484,11 +471,24 @@ test("Subscribe to Record with specific id", async () => {
   const events: Event[] = [];
   for await (const event of eventStream) {
     events.push(event);
+
+    if (events.length === 2) {
+      break;
+    }
   }
+  await eventStream.cancel();
 
   expect(events).toHaveLength(2);
-  expect(events[0]["Update"]["text_not_null"]).equals(updatedMessage);
-  expect(events[1]["Delete"]["text_not_null"]).equals(updatedMessage);
+  expect(
+    ((events[0] as ChangeUpdateEvent)["Update"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
+  expect(
+    ((events[1] as ChangeDeleteEvent)["Delete"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
 });
 
 test("Subscribe to entire table", async () => {
@@ -517,47 +517,25 @@ test("Subscribe to entire table", async () => {
       break;
     }
   }
+  await eventStream.cancel();
 
   expect(events).toHaveLength(3);
-  expect(events[0]["Insert"]["text_not_null"]).equals(createMessage);
-  expect(events[1]["Update"]["text_not_null"]).equals(updatedMessage);
-  expect(events[2]["Delete"]["text_not_null"]).equals(updatedMessage);
+  expect(
+    ((events[0] as ChangeInsertEvent)["Insert"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(createMessage);
+  expect(
+    ((events[1] as ChangeUpdateEvent)["Update"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
+  expect(
+    ((events[2] as ChangeDeleteEvent)["Delete"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
 });
-
-if (USE_WS) {
-  test("Subscribe to entire table via WebSocket", async () => {
-    const client = await connect();
-    const api = client.records<NewSimpleStrict>("simple_strict_table");
-
-    const eventStream = await subscribeWs(api as RecordApiImpl, "*");
-
-    const now = new Date().getTime();
-    const createMessage = `ts client ws realtime test 0: =?&${now}`;
-    const id = (await api.create({
-      text_not_null: createMessage,
-    })) as string;
-
-    const updatedMessage = `ts client ws updated realtime test 0: ${now}`;
-    const updatedValue: Partial<SimpleStrict> = {
-      text_not_null: updatedMessage,
-    };
-    await api.update(id, updatedValue);
-    await api.delete(id);
-
-    const events: Event[] = [];
-    for await (const event of eventStream) {
-      events.push(event);
-      if (events.length === 3) {
-        break;
-      }
-    }
-
-    expect(events).toHaveLength(3);
-    expect(events[0]["Insert"]["text_not_null"]).equals(createMessage);
-    expect(events[1]["Update"]["text_not_null"]).equals(updatedMessage);
-    expect(events[2]["Delete"]["text_not_null"]).equals(updatedMessage);
-  });
-}
 
 test("Subscribe to table with record filters", async () => {
   const client = await connect();
@@ -598,8 +576,16 @@ test("Subscribe to table with record filters", async () => {
 
   // We should have skipped the creation.
   expect(events).toHaveLength(2);
-  expect(events[0]["Update"]["text_not_null"]).equals(updatedMessage);
-  expect(events[1]["Delete"]["text_not_null"]).equals(updatedMessage);
+  expect(
+    ((events[0] as ChangeUpdateEvent)["Update"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
+  expect(
+    ((events[1] as ChangeDeleteEvent)["Delete"] as SimpleStrict)[
+      "text_not_null"
+    ],
+  ).equals(updatedMessage);
 });
 
 type FileUpload = {
@@ -679,27 +665,27 @@ async function testBase64FileUploads(
 
   // Test file download endpoints to verify actual file content
   const singleFileResponse = await fetch(
-    `http://${ADDRESS}${filePath(apiName, recordId, "single_file")}`,
+    `http://${serverAddress()}${filePath(apiName, recordId, "single_file")}`,
   );
   expect(await singleFileResponse.bytes()).toEqual(testBytes1);
 
   const singleFilesResponse = await fetch(
-    `http://${ADDRESS}${filesPath(apiName, recordId, "single_file", singleFile.filename)}`,
+    `http://${serverAddress()}${filesPath(apiName, recordId, "single_file", singleFile.filename)}`,
   );
   expect(await singleFilesResponse.bytes()).toEqual(testBytes1);
 
   const multiFile1Response = await fetch(
-    `http://${ADDRESS}${filesPath(apiName, recordId, "multiple_files", multipleFiles[0].filename)}`,
+    `http://${serverAddress()}${filesPath(apiName, recordId, "multiple_files", multipleFiles[0].filename)}`,
   );
   expect(await multiFile1Response.bytes()).toEqual(testBytes2);
 
   const multiFile2Response = await fetch(
-    `http://${ADDRESS}${filesPath(apiName, recordId, "multiple_files", multipleFiles[1].filename)}`,
+    `http://${serverAddress()}${filesPath(apiName, recordId, "multiple_files", multipleFiles[1].filename)}`,
   );
   expect(await multiFile2Response.bytes()).toEqual(testBytes3);
 
   const notFoundResponse = await fetch(
-    `http://${ADDRESS}${filesPath(apiName, recordId, "multiple_files", "non-existent-filename")}`,
+    `http://${serverAddress()}${filesPath(apiName, recordId, "multiple_files", "non-existent-filename")}`,
   );
   expect(notFoundResponse.status).toEqual(status.NOT_FOUND);
 
@@ -724,7 +710,6 @@ test("GeoJson access", async ({ expect }) => {
 
   {
     const json: FeatureCollection = await api.listGeoOp("geom").query();
-    console.log("HERE", json);
     expect(json.features).toHaveLength(4);
   }
 

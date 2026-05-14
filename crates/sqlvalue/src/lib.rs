@@ -75,11 +75,11 @@ impl Default for SqlValue {
 }
 
 #[cfg(feature = "rusqlite")]
-impl TryFrom<SqlValue> for rusqlite::types::Value {
+impl TryFrom<SqlValue> for trailbase_sqlite::Value {
   type Error = DecodeError;
 
   fn try_from(value: SqlValue) -> Result<Self, Self::Error> {
-    use rusqlite::types::Value;
+    use trailbase_sqlite::Value;
 
     return Ok(match value {
       SqlValue::Null => Value::Null,
@@ -98,9 +98,9 @@ impl TryFrom<SqlValue> for rusqlite::types::Value {
 }
 
 #[cfg(feature = "rusqlite")]
-impl From<rusqlite::types::Value> for SqlValue {
-  fn from(value: rusqlite::types::Value) -> Self {
-    use rusqlite::types::Value;
+impl From<trailbase_sqlite::Value> for SqlValue {
+  fn from(value: trailbase_sqlite::Value) -> Self {
+    use trailbase_sqlite::Value;
 
     return match value {
       Value::Null => SqlValue::Null,
@@ -113,9 +113,9 @@ impl From<rusqlite::types::Value> for SqlValue {
 }
 
 #[cfg(feature = "rusqlite")]
-impl From<&rusqlite::types::Value> for SqlValue {
-  fn from(value: &rusqlite::types::Value) -> Self {
-    use rusqlite::types::Value;
+impl From<&trailbase_sqlite::Value> for SqlValue {
+  fn from(value: &trailbase_sqlite::Value) -> Self {
+    use trailbase_sqlite::Value;
 
     return match value {
       Value::Null => SqlValue::Null,
@@ -127,6 +127,7 @@ impl From<&rusqlite::types::Value> for SqlValue {
   }
 }
 
+/// Turns a hex string, e.g. "BA5E" into a byte vector.
 fn decode_hex(s: &str) -> Result<Vec<u8>, DecodeError> {
   if !s.len().is_multiple_of(2) {
     return Err(DecodeError::Hex);
@@ -136,4 +137,17 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, DecodeError> {
     .step_by(2)
     .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| DecodeError::Hex))
     .collect();
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn decode_hex_test() {
+    assert_eq!(Vec::<u8>::new(), decode_hex("").unwrap());
+    assert!(decode_hex("BA5E").is_ok());
+    assert!(decode_hex("ba5e").is_ok());
+    assert!(decode_hex("ba5").is_err());
+  }
 }

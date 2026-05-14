@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 
 use trailbase::AppState;
-use trailbase::api::{CreateUserRequest, create_user_handler, login_with_password};
+use trailbase::api::{CreateUserRequest, create_user_handler, login_with_password_for_test};
 use trailbase::config::proto::{PermissionFlag, RecordApiConfig};
 use trailbase::constants::RECORD_API_PATH;
 use trailbase::{DataDir, Server, ServerOptions};
@@ -60,10 +60,10 @@ async fn add_room(
   name: &str,
 ) -> Result<[u8; 16], anyhow::Error> {
   let room: [u8; 16] = conn
-    .query_row_f(
+    .write_query_row_get(
       "INSERT INTO room (name) VALUES ($1) RETURNING id",
       params!(name.to_string()),
-      |row| row.get(0),
+      0,
     )
     .await?
     .unwrap();
@@ -97,7 +97,7 @@ pub(crate) async fn add_record_api_config(
   state: &AppState,
   api: RecordApiConfig,
 ) -> Result<(), anyhow::Error> {
-  let mut config = state.get_config();
+  let mut config = (*state.get_config()).clone();
   config.record_apis.push(api);
   return Ok(state.validate_and_update_config(config, None).await?);
 }
@@ -150,8 +150,9 @@ async fn setup_app() -> Result<Setup, anyhow::Error> {
   .id
   .into_bytes();
 
-  let user_x_token = login_with_password(&app.state, email, password)
+  let user_x_token = login_with_password_for_test(&app.state, email, password)
     .await?
+    .unwrap()
     .auth_token;
 
   add_user_to_room(conn, user_x, room).await?;
@@ -239,6 +240,7 @@ fn create_message_benchmark(b: &mut Bencher, runtime: &tokio::runtime::Runtime, 
 
 fn benchmark_group(c: &mut Criterion) {
   let runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(8)
     .enable_all()
     .build()
     .unwrap();

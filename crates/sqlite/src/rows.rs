@@ -1,8 +1,11 @@
-use rusqlite::{Statement, types};
 use std::fmt::Debug;
 use std::ops::Index;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use crate::error::Error;
+use crate::from_sql::{FromSql, FromSqlError};
+use crate::value::Value;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ValueType {
@@ -30,23 +33,16 @@ impl FromStr for ValueType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
-  name: String,
-  decl_type: Option<ValueType>,
+  pub(crate) name: String,
+  pub(crate) decl_type: Option<ValueType>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Rows(pub(crate) Vec<Row>, pub(crate) Arc<Vec<Column>>);
 
 impl Rows {
-  pub fn from_rows(mut rows: rusqlite::Rows) -> rusqlite::Result<Self> {
-    let columns: Arc<Vec<Column>> = Arc::new(rows.as_ref().map_or_else(Vec::new, columns));
-
-    let mut result = vec![];
-    while let Some(row) = rows.next()? {
-      result.push(Row::from_row(row, columns.clone())?);
-    }
-
-    return Ok(Self(result, columns));
+  pub fn empty() -> Self {
+    return Self(vec![], Arc::new(vec![]));
   }
 
   pub fn len(&self) -> usize {
@@ -77,22 +73,16 @@ impl Rows {
     return self.1.get(idx).map(|c| c.name.as_str());
   }
 
-  pub fn column_type(&self, idx: usize) -> std::result::Result<ValueType, rusqlite::Error> {
-    if let Some(c) = self.1.get(idx) {
-      return c.decl_type.ok_or_else(|| {
-        rusqlite::Error::InvalidColumnType(
-          idx,
-          self.column_name(idx).unwrap_or("?").to_string(),
-          types::Type::Null,
-        )
+  pub fn column_type(&self, idx: usize) -> Result<ValueType, Error> {
+    return self
+      .1
+      .get(idx)
+      .and_then(|c| c.decl_type)
+      .ok_or_else(|| Error::InvalidColumnType {
+        idx,
+        name: self.column_name(idx).unwrap_or("?").to_string(),
+        decl_type: None,
       });
-    }
-
-    return Err(rusqlite::Error::InvalidColumnType(
-      idx,
-      self.column_name(idx).unwrap_or("?").to_string(),
-      types::Type::Null,
-    ));
   }
 }
 
@@ -113,40 +103,10 @@ impl IntoIterator for Rows {
   }
 }
 
-pub(crate) fn columns(stmt: &Statement<'_>) -> Vec<Column> {
-  return stmt
-    .columns()
-    .into_iter()
-    .map(|c| Column {
-      name: c.name().to_string(),
-      decl_type: c.decl_type().and_then(|s| ValueType::from_str(s).ok()),
-    })
-    .collect();
-}
-
 #[derive(Debug)]
-pub struct Row(pub Vec<types::Value>, pub Arc<Vec<Column>>);
+pub struct Row(pub Vec<Value>, pub Arc<Vec<Column>>);
 
 impl Row {
-  pub(crate) fn from_row(row: &rusqlite::Row, cols: Arc<Vec<Column>>) -> rusqlite::Result<Self> {
-    #[cfg(debug_assertions)]
-    if let Some(rc) = Some(columns(row.as_ref()))
-      && rc.len() != cols.len()
-    {
-      // Apparently this can happen during schema manipulations, e.g. when deleting a column
-      // :shrug:. We normalize everything to the same rows schema rather than dealing with
-      // jagged tables.
-      log::warn!("Rows/row column mismatch: {cols:?} vs {rc:?}");
-    }
-
-    // We have to access by index here, since names can be duplicate.
-    let values = (0..cols.len())
-      .map(|idx| row.get(idx).unwrap_or(types::Value::Null))
-      .collect();
-
-    return Ok(Self(values, cols));
-  }
-
   pub fn split_off(&mut self, at: usize) -> Row {
     let split_values = self.0.split_off(at);
     let mut columns = (*self.1).clone();
@@ -155,17 +115,17 @@ impl Row {
     return Row(split_values, Arc::new(split_columns));
   }
 
-  pub fn get<T>(&self, idx: usize) -> types::FromSqlResult<T>
+  pub fn get<T>(&self, idx: usize) -> Result<T, FromSqlError>
   where
-    T: types::FromSql,
+    T: FromSql,
   {
     let Some(value) = self.0.get(idx) else {
-      return Err(types::FromSqlError::OutOfRange(idx as i64));
+      return Err(FromSqlError::OutOfRange(idx as i64));
     };
     return T::column_result(value.into());
   }
 
-  pub fn get_value(&self, idx: usize) -> Option<&types::Value> {
+  pub fn get_value(&self, idx: usize) -> Option<&Value> {
     return self.0.get(idx);
   }
 
@@ -177,7 +137,7 @@ impl Row {
     return self.0.is_empty();
   }
 
-  pub fn last(&self) -> Option<&types::Value> {
+  pub fn last(&self) -> Option<&Value> {
     return self.0.last();
   }
 
@@ -191,7 +151,7 @@ impl Row {
 }
 
 impl Index<usize> for Row {
-  type Output = types::Value;
+  type Output = Value;
 
   fn index(&self, idx: usize) -> &Self::Output {
     return &self.0[idx];

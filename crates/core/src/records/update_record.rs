@@ -38,14 +38,22 @@ pub async fn update_record_handler(
   };
 
   let record_id = api.primary_key_to_value(record)?;
-  let pk_meta = api.record_pk_column();
+
+  #[cfg(debug_assertions)]
+  crate::records::json_schema::validate_api_json_schema(
+    &state,
+    &api,
+    trailbase_schema::json_schema::JsonSchemaMode::Update,
+    &serde_json::Value::Object(request.clone()),
+  )
+  .map_err(|_err| RecordError::BadRequest("Invalid Parameters"))?;
 
   let mut lazy_params = LazyParams::for_update(
     &api,
     state.json_schema_registry().clone(),
     request,
     multipart_files,
-    pk_meta.column.name.clone(),
+    api.record_pk_column().column.name.clone(),
     record_id.clone(),
   );
 
@@ -100,7 +108,7 @@ mod test {
 
     state
       .conn()
-      .execute_batch(
+      .execute_batch(conditionally_transform_query(
         r#"
           CREATE TABLE "update" (
             "id"      INTEGER PRIMARY KEY,
@@ -109,7 +117,7 @@ mod test {
             "text"    TEXT
           ) STRICT;
         "#,
-      )
+      ))
       .await
       .unwrap();
 
@@ -338,7 +346,7 @@ mod test {
 
     state
       .conn()
-      .execute_batch(
+      .execute_batch(conditionally_transform_query(
         r#"
           CREATE TABLE test (
             "user"    BLOB PRIMARY KEY REFERENCES _user(id),
@@ -347,7 +355,7 @@ mod test {
 
           INSERT INTO test (user, data) SELECT id, 'secret' FROM _user WHERE email = 'x@test.org';
         "#,
-      )
+      ))
       .await
       .unwrap();
 

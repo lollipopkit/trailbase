@@ -1,4 +1,4 @@
-import type { Value as WitValue } from "trailbase:database/sqlite@0.1.0";
+import type { Value as WitValue } from "trailbase:database/sqlite@0.1.1";
 import { SqlValue } from "@common/SqlValue";
 import { Blob } from "@common/Blob";
 
@@ -88,4 +88,15 @@ export function fromWitValue(val: WitValue): Value {
     case "blob":
       return val.val;
   }
+}
+
+/// Escapes arbitrary strings as a sqfe SQL string literal, e.g. 'foo'.
+export function escape(s: string): string {
+  const out = s
+    .replace(/'/g, "''")
+    // Null byte isn't an injection vector itself, just being defensive here
+    // for downstream consumers.
+    .replace(/\0/g, "\\0");
+
+  return `'${out}'`;
 }

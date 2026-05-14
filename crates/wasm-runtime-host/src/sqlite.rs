@@ -1,12 +1,16 @@
 use bytes::Bytes;
+use http::Uri;
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use rusqlite::Transaction;
 use self_cell::{MutBorrow, self_cell};
+use sqlite3_parser::ast::{OneSelect, Select, Stmt};
 use tokio::time::Duration;
-use trailbase_sqlite::connection::ArcLockGuard;
+use trailbase_schema::parse::parse_into_statement;
+use trailbase_schema::sqlite::unquote_expr;
+use trailbase_sqlite::{ArcLockGuard, LockError, Rows};
 use trailbase_sqlvalue::{DecodeError, SqlValue};
 use trailbase_wasm_common::{SqliteRequest, SqliteResponse};
-use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
 self_cell!(
   pub(crate) struct OwnedTx {
@@ -17,84 +21,202 @@ self_cell!(
   }
 );
 
-pub(crate) async fn new_tx(conn: trailbase_sqlite::Connection) -> Result<OwnedTx, rusqlite::Error> {
-  for _ in 0..200 {
-    let Some(lock) = conn.try_write_arc_lock_for(Duration::from_micros(100)) else {
-      tokio::time::sleep(Duration::from_micros(400)).await;
-      continue;
-    };
+pub(crate) async fn acquire_transaction_lock_with_timeout(
+  conn: trailbase_sqlite::Connection,
+  timeout: Duration,
+) -> Result<OwnedTx, LockError> {
+  let try_until = std::time::SystemTime::now() + timeout;
+  loop {
+    match conn.try_write_arc_lock_for(Duration::from_micros(50)) {
+      Ok(lock) => {
+        return OwnedTx::try_new(MutBorrow::new(lock), |owner| {
+          return owner.borrow_mut().transaction();
+        })
+        .map_err(|err| {
+          log::error!("{err}");
+          return LockError::NotSupported;
+        });
+      }
+      Err(LockError::Timeout) => {
+        // Sleep a little.
+        tokio::time::sleep(Duration::from_micros(200)).await;
 
-    return OwnedTx::try_new(MutBorrow::new(lock), |owner| {
-      return owner.borrow_mut().transaction();
-    });
+        if std::time::SystemTime::now() > try_until {
+          return Err(LockError::Timeout);
+        }
+        continue;
+      }
+      Err(LockError::NotSupported) => {
+        return Err(LockError::NotSupported);
+      }
+    }
   }
-
-  return Err(rusqlite::Error::ToSqlConversionFailure(
-    "Failed to acquire lock".into(),
-  ));
 }
 
-async fn handle_sqlite_request_impl(
+async fn handle_sqlite_execute(
   conn: trailbase_sqlite::Connection,
-  request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+  request: SqliteRequest,
 ) -> Result<SqliteResponse, String> {
-  return match request.uri().path() {
-    "/execute" => {
-      let sqlite_request = to_request(request).await?;
-
-      let rows_affected = conn
+  // NOTE: We're doing redundant work here: first we parse and then SQLite parses again. We do
+  // this to more intelligently schedule requests based on whether they're reads or writes w/o
+  // requiring users to use two separate entry points and possibly making a mistake. Ultimately,
+  // we believe it's worth it to allow cheap reads.
+  let rows_affected = match parse_into_statement(&request.query) {
+    // NOTE: We need to handle connection mutations (attach, detach) specially, so that they
+    // apply to all internal read and write connections.
+    Ok(Some(Stmt::Attach { expr, db_name, .. })) => {
+      conn
+        .attach(&unquote_expr(&expr), &unquote_expr(&db_name))
+        .await
+        .map_err(sqlite_err)?;
+      0
+    }
+    Ok(Some(Stmt::Detach(name))) => {
+      conn
+        .detach(&unquote_expr(&name))
+        .await
+        .map_err(sqlite_err)?;
+      0
+    }
+    _ => {
+      match conn
         .execute(
-          sqlite_request.query,
-          sql_values_to_sqlite_params(sqlite_request.params).map_err(sqlite_err)?,
+          request.query,
+          sql_values_to_sqlite_params(request.params).map_err(sqlite_err)?,
         )
         .await
-        .map_err(sqlite_err)?;
-
-      Ok(SqliteResponse::Execute { rows_affected })
+      {
+        Ok(rows_affected) => rows_affected,
+        Err(err) => {
+          return Ok(SqliteResponse::Error(err.to_string()));
+        }
+      }
     }
-    "/query" => {
-      let sqlite_request = to_request(request).await?;
-
-      let rows = conn
-        .write_query_rows(
-          sqlite_request.query,
-          sql_values_to_sqlite_params(sqlite_request.params).map_err(sqlite_err)?,
-        )
-        .await
-        .map_err(sqlite_err)?;
-
-      let json_rows = rows
-        .iter()
-        .map(convert_values)
-        .collect::<Result<Vec<_>, _>>()?;
-
-      Ok(SqliteResponse::Query { rows: json_rows })
-    }
-    _ => Err("Not found".to_string()),
   };
+
+  Ok(SqliteResponse::Execute { rows_affected })
+}
+
+async fn handle_sqlite_query(
+  conn: trailbase_sqlite::Connection,
+  request: SqliteRequest,
+) -> Result<SqliteResponse, String> {
+  // Handles write queries.
+  async fn write(
+    conn: trailbase_sqlite::Connection,
+    request: SqliteRequest,
+  ) -> Result<Rows, String> {
+    return conn
+      .write_query_rows(
+        request.query,
+        sql_values_to_sqlite_params(request.params).map_err(sqlite_err)?,
+      )
+      .await
+      .map_err(sqlite_err);
+  }
+
+  // Handles read queries.
+  async fn read(
+    conn: trailbase_sqlite::Connection,
+    request: SqliteRequest,
+  ) -> Result<Rows, String> {
+    return conn
+      .read_query_rows(
+        request.query,
+        sql_values_to_sqlite_params(request.params).map_err(sqlite_err)?,
+      )
+      .await
+      .map_err(sqlite_err);
+  }
+
+  // NOTE: We're doing redundant work here: first we parse and then SQLite parses again. We do
+  // this to more intelligently schedule requests based on whether they're reads or writes w/o
+  // requiring users to use two separate entry points and possibly making a mistake. Ultimately,
+  // we believe it's worth it to allow cheap reads.
+  let rows = match parse_into_statement(&request.query) {
+    // NOTE: We need to handle connection mutations (attach, detach) specially, so that they
+    // apply to all internal read and write connections.
+    Ok(Some(Stmt::Attach { expr, db_name, .. })) => {
+      conn
+        .attach(&unquote_expr(&expr), &unquote_expr(&db_name))
+        .await
+        .map_err(sqlite_err)?;
+      Rows::empty()
+    }
+    Ok(Some(Stmt::Detach(name))) => {
+      conn
+        .detach(&unquote_expr(&name))
+        .await
+        .map_err(sqlite_err)?;
+      Rows::empty()
+    }
+    Ok(Some(Stmt::Select(select))) if is_readonly_select(&select) => {
+      match read(conn, request).await {
+        Ok(rows) => rows,
+        Err(err) => {
+          return Ok(SqliteResponse::Error(err));
+        }
+      }
+    }
+    _ => match write(conn, request).await {
+      Ok(rows) => rows,
+      Err(err) => {
+        return Ok(SqliteResponse::Error(err));
+      }
+    },
+  };
+
+  let json_rows = rows
+    .iter()
+    .map(convert_values)
+    .collect::<Result<Vec<_>, _>>()?;
+
+  return Ok(SqliteResponse::Query { rows: json_rows });
 }
 
 pub(crate) async fn handle_sqlite_request(
   conn: trailbase_sqlite::Connection,
-  request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-) -> Result<wasmtime_wasi_http::types::IncomingResponse, ErrorCode> {
-  return match handle_sqlite_request_impl(conn, request).await {
+  request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+) -> Result<wasmtime_wasi_http::p2::types::IncomingResponse, ErrorCode> {
+  let (uri, sqlite_request) = match to_request(request).await {
+    Ok(request) => request,
+    Err(err) => {
+      return to_response(SqliteResponse::Error(err));
+    }
+  };
+
+  let response = match uri.path() {
+    "/execute" => handle_sqlite_execute(conn, sqlite_request).await,
+    "/query" => handle_sqlite_query(conn, sqlite_request).await,
+    _ => {
+      // NOTE: Should not happen and doesn't need to be handled by the client as
+      // SqliteResponse::Error.
+      return Err(ErrorCode::InternalError(Some(format!(
+        "Invalid path: {uri}"
+      ))));
+    }
+  };
+
+  return match response {
     Ok(response) => to_response(response),
     Err(err) => to_response(SqliteResponse::Error(err)),
   };
 }
 
 async fn to_request(
-  request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-) -> Result<SqliteRequest, String> {
-  let (_parts, body) = request.into_parts();
+  request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+) -> Result<(Uri, SqliteRequest), String> {
+  let (parts, body) = request.into_parts();
   let bytes: Bytes = body.collect().await.map_err(sqlite_err)?.to_bytes();
-  return serde_json::from_slice(&bytes).map_err(sqlite_err);
+  return Ok((
+    parts.uri,
+    serde_json::from_slice(&bytes).map_err(sqlite_err)?,
+  ));
 }
 
 fn to_response(
   response: SqliteResponse,
-) -> Result<wasmtime_wasi_http::types::IncomingResponse, ErrorCode> {
+) -> Result<wasmtime_wasi_http::p2::types::IncomingResponse, ErrorCode> {
   let body =
     serde_json::to_vec(&response).map_err(|err| ErrorCode::InternalError(Some(err.to_string())))?;
 
@@ -103,7 +225,7 @@ fn to_response(
     .body(bytes_to_body(Bytes::from_owner(body)))
     .map_err(|err| ErrorCode::InternalError(Some(err.to_string())))?;
 
-  return Ok(wasmtime_wasi_http::types::IncomingResponse {
+  return Ok(wasmtime_wasi_http::p2::types::IncomingResponse {
     resp,
     worker: None,
     between_bytes_timeout: std::time::Duration::ZERO,
@@ -135,7 +257,222 @@ pub fn sqlite_err<E: std::error::Error>(err: E) -> String {
   return err.to_string();
 }
 
+#[allow(clippy::single_match)]
+#[inline]
+fn is_readonly_select(select: &Select) -> bool {
+  fn is_readonly_one_select(select: &OneSelect) -> bool {
+    return match select {
+      OneSelect::Select { .. } => {
+        // for column in columns {
+        //   if let ResultColumn::Expr(Expr::FunctionCall { name, .. }, _) = column {
+        //     // Filter out SQLean's "define" which is clearly mutating and will
+        //     // leave connections in an inconsistent state.
+        //     //
+        //     // QUESTION: Should we do more, e.g. error and reject the query? It's likely not
+        //     // enough to just relegate this to the write connection.
+        //     match name.0.as_bytes() {
+        //       b"define" | b"undefine" | b"define_free" => {
+        //         return false;
+        //       }
+        //       _ => {}
+        //     }
+        //   }
+        // }
+
+        return true;
+      }
+      OneSelect::Values(_) => true,
+    };
+  }
+
+  if let Some(ref with) = select.with {
+    for cte in &with.ctes {
+      if !is_readonly_select(&cte.select) {
+        return false;
+      }
+    }
+  }
+
+  let body = &select.body;
+  if let Some(ref compounds) = body.compounds {
+    for compound in compounds {
+      if !is_readonly_one_select(&compound.select) {
+        return false;
+      }
+    }
+  }
+
+  return is_readonly_one_select(&body.select);
+}
+
 // #[inline]
 // fn empty<E>() -> BoxBody<Bytes, E> {
 //   BoxBody::new(http_body_util::Empty::new().map_err(|_| unreachable!()))
 // }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use trailbase_sqlite::Connection;
+
+  #[tokio::test]
+  async fn handle_sqlite_execute_test() {
+    let conn = Connection::open_in_memory().unwrap();
+
+    let _ = handle_sqlite_execute(
+      conn.clone(),
+      SqliteRequest {
+        query: "CREATE TABLE test (id INTEGER PRIMARY KEY)".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    let response = handle_sqlite_execute(
+      conn.clone(),
+      SqliteRequest {
+        query: "INSERT INTO test (id) VALUES (?1), (?2)".to_string(),
+        params: vec![SqlValue::Integer(2), SqlValue::Integer(3)],
+      },
+    )
+    .await
+    .unwrap();
+
+    let SqliteResponse::Execute { rows_affected } = response else {
+      panic!("expected execute, got: {response:?}");
+    };
+
+    assert_eq!(2, rows_affected);
+
+    // Attach
+    let _ = handle_sqlite_execute(
+      conn.clone(),
+      SqliteRequest {
+        query: "ATTACH DATABASE ':memory:' AS foo".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    // Detach
+    let _ = handle_sqlite_execute(
+      conn.clone(),
+      SqliteRequest {
+        query: "DETACH DATABASE foo".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    // Error
+    let response = handle_sqlite_execute(
+      conn.clone(),
+      SqliteRequest {
+        query: "NOT A VALID QUERY :)".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    let SqliteResponse::Error(err) = response else {
+      panic!("expected error, got: {response:?}");
+    };
+
+    assert!(
+      err.contains("near \"NOT\": syntax error in NOT A VALID QUERY :) at offset 0"),
+      "Got: {err:?}"
+    );
+  }
+
+  #[tokio::test]
+  async fn handle_sqlite_query_test() {
+    let conn = Connection::open_in_memory().unwrap();
+
+    // Write.
+    let _ = handle_sqlite_query(
+      conn.clone(),
+      SqliteRequest {
+        query: "CREATE TABLE test (id INTEGER PRIMARY KEY);".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    // Read
+    let response = handle_sqlite_query(
+      conn.clone(),
+      SqliteRequest {
+        query: "SELECT * FROM test".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    let SqliteResponse::Query { rows } = response else {
+      panic!("expected query, got: {response:?}");
+    };
+
+    assert_eq!(0, rows.len());
+
+    // Attach
+    let _ = handle_sqlite_query(
+      conn.clone(),
+      SqliteRequest {
+        query: "ATTACH DATABASE ':memory:' AS foo".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    // Detach
+    let _ = handle_sqlite_query(
+      conn.clone(),
+      SqliteRequest {
+        query: "DETACH DATABASE foo".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    // Error
+    let response = handle_sqlite_query(
+      conn.clone(),
+      SqliteRequest {
+        query: "NOT A VALID QUERY :)".to_string(),
+        params: vec![],
+      },
+    )
+    .await
+    .unwrap();
+
+    let SqliteResponse::Error(err) = response else {
+      panic!("expected error, got: {response:?}");
+    };
+
+    assert!(
+      err.contains("near \"NOT\": syntax error in NOT A VALID QUERY :) at offset 0"),
+      "Got: {err:?}"
+    );
+  }
+
+  fn parse_select(s: &str) -> Box<Select> {
+    let stmt = parse_into_statement(s).unwrap().unwrap();
+    if let Stmt::Select(select) = stmt {
+      return select;
+    }
+    panic!("Expected SELECT, got: {stmt:?}");
+  }
+
+  #[test]
+  fn readonly_select_filter_test() {
+    assert!(is_readonly_select(&parse_select("SELECT * FROM test;")));
+  }
+}

@@ -5,7 +5,7 @@ use ts_rs::TS;
 
 use crate::admin::AdminError as Error;
 use crate::app_state::AppState;
-use crate::transaction::TransactionRecorder;
+use crate::transaction_recorder::TransactionRecorder;
 
 #[derive(Clone, Debug, Deserialize, TS)]
 #[ts(export)]
@@ -41,10 +41,10 @@ pub async fn create_table_handler(
   let create_table_query = table_schema.create_table_statement();
 
   let tx_log = conn
-    .call(move |conn| {
-      let mut tx = TransactionRecorder::new(conn)?;
+    .transaction(move |tx| {
+      let mut tx = TransactionRecorder::new(tx);
 
-      tx.execute(&create_table_query, ())?;
+      tx.execute(create_table_query, ())?;
 
       return tx
         .rollback()

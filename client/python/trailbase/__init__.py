@@ -8,10 +8,11 @@ import logging
 import typing
 import json
 
+from abc import ABC, abstractmethod
 from enum import Enum
 from contextlib import contextmanager
 from time import time
-from typing import TypeAlias, cast, final
+from typing import ContextManager, TypeAlias, cast, final
 
 JSON: TypeAlias = dict[str, "JSON"] | list["JSON"] | str | int | float | bool | None
 JSON_OBJECT: TypeAlias = dict[str, JSON]
@@ -202,7 +203,102 @@ class TokenState:
         return base
 
 
-class ThinClient:
+class Event:
+    seq: int | None
+
+    def __init__(self, seq: int | None):
+        self.seq = seq
+
+
+class InsertEvent(Event):
+    value: JSON_OBJECT
+
+    def __init__(self, seq: int | None, value: JSON_OBJECT):
+        super().__init__(seq)
+        self.value = value
+
+
+class UpdateEvent(Event):
+    value: JSON_OBJECT
+
+    def __init__(self, seq: int | None, value: JSON_OBJECT):
+        super().__init__(seq)
+        self.value = value
+
+
+class DeleteEvent(Event):
+    value: JSON_OBJECT
+
+    def __init__(self, seq: int | None, value: JSON_OBJECT):
+        super().__init__(seq)
+        self.value = value
+
+
+class ErrorEvent(Event):
+    status: int
+    message: str | None
+
+    def __init__(self, seq: int | None, status: int, message: str | None):
+        super().__init__(seq)
+        self.status = status
+        self.message = message
+
+
+EVENT_ERROR_STATUS_UNKNOWN = 0
+EVENT_ERROR_STATUS_FORBIDDEN = 1
+EVENT_ERROR_STATUS_LOSS = 2
+
+
+EVENT: TypeAlias = UpdateEvent | InsertEvent | DeleteEvent | ErrorEvent
+
+
+def parseEvent(obj: JSON_OBJECT) -> EVENT | None:
+    seq = cast(int | None, obj["seq"])
+
+    insert = obj.get("Insert")
+    if insert is not None:
+        return InsertEvent(seq, cast(JSON_OBJECT, insert))
+
+    update = obj.get("Update")
+    if update is not None:
+        return UpdateEvent(seq, cast(JSON_OBJECT, update))
+
+    delete = obj.get("Delete")
+    if delete is not None:
+        return DeleteEvent(seq, cast(JSON_OBJECT, delete))
+
+    error = cast(JSON_OBJECT | None, obj.get("Error"))
+    if error is not None:
+        return ErrorEvent(seq, cast(int, error["status"]), cast(str | None, error.get("message")))
+
+    raise Exception(f"Failed to parse event: {obj}")
+
+
+class Transport(ABC):
+    @abstractmethod
+    def fetch(
+        self,
+        path: str,
+        method: str | None = "GET",
+        headers: dict[str, str] | None = None,
+        queryParams: dict[str, str] | None = None,
+        body: JSON | None = None,
+    ) -> httpx.Response:
+        pass
+
+    @abstractmethod
+    def stream(
+        self,
+        path: str,
+        method: str | None = "GET",
+        headers: dict[str, str] | None = None,
+        queryParams: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> ContextManager[httpx.Response]:
+        pass
+
+
+class DefaultTransport(Transport):
     http_client: httpx.Client
     site: str
 
@@ -213,30 +309,30 @@ class ThinClient:
     def fetch(
         self,
         path: str,
-        tokenState: TokenState,
         method: str | None = "GET",
-        data: JSON | None = None,
+        headers: dict[str, str] | None = None,
         queryParams: dict[str, str] | None = None,
+        body: JSON | None = None,
     ) -> httpx.Response:
         assert not path.startswith("/")
         return self.http_client.request(
             method=method or "GET",
             url=f"{self.site}/{path}",
-            json=data,
-            headers=tokenState.headers,
+            json=body,
+            headers=headers,
             params=queryParams,
         )
 
     def stream(
         self,
         path: str,
-        tokenState: TokenState,
         method: str | None = "GET",
+        headers: dict[str, str] | None = None,
         queryParams: dict[str, str] | None = None,
         timeout: httpx.Timeout | None = None,
-    ):
+    ) -> ContextManager[httpx.Response]:
         assert not path.startswith("/")
-        headers = tokenState.headers.copy()
+        headers = (headers or {}).copy()
         headers["Accept"] = "text/event-stream"
         headers["Cache-Control"] = "no-store"
 
@@ -264,9 +360,7 @@ class ThinClient:
 
 
 class Client:
-    _authApi: str = "api/auth/v1"
-
-    _client: ThinClient
+    _transport: Transport
     _site: str
     _tokenState: TokenState
 
@@ -274,9 +368,9 @@ class Client:
         self,
         site: str,
         tokens: Tokens | None = None,
-        http_client: httpx.Client | None = None,
+        transport: Transport | None = None,
     ) -> None:
-        self._client = ThinClient(site, http_client)
+        self._transport = transport or DefaultTransport(site)
         self._site = site
         self._tokenState = TokenState.build(tokens)
 
@@ -300,7 +394,7 @@ class Client:
 
     def login(self, email: str, password: str) -> MultiFactorAuthToken | None:
         response = self.fetch(
-            f"{self._authApi}/login",
+            f"{_AUTH_API}/login",
             method="POST",
             data={
                 "email": email,
@@ -314,14 +408,13 @@ class Client:
         elif response.status_code > 200:
             raise FetchException(response.status_code, response.text)
 
-        tokens = Tokens.from_json(response.json())
-        self._updateTokens(tokens)
+        self._set_token_state(TokenState.build(Tokens.from_json(response.json())))
 
         return None
 
     def login_second(self, token: MultiFactorAuthToken, code: str) -> None:
         response = self.fetch(
-            f"{self._authApi}/login_mfa",
+            f"{_AUTH_API}/login_mfa",
             method="POST",
             data={
                 "mfa_token": token.token,
@@ -329,12 +422,11 @@ class Client:
             },
         )
 
-        tokens = Tokens.from_json(response.json())
-        self._updateTokens(tokens)
+        self._set_token_state(TokenState.build(Tokens.from_json(response.json())))
 
     def request_otp(self, email: str, redirect_uri: str | None = None) -> None:
         self.fetch(
-            f"{self._authApi}/otp/request",
+            f"{_AUTH_API}/otp/request",
             method="POST",
             data={
                 "email": email,
@@ -344,7 +436,7 @@ class Client:
 
     def login_otp(self, email: str, code: str) -> None:
         response = self.fetch(
-            f"{self._authApi}/otp/login",
+            f"{_AUTH_API}/otp/login",
             method="POST",
             data={
                 "email": email,
@@ -352,8 +444,7 @@ class Client:
             },
         )
 
-        tokens = Tokens.from_json(response.json())
-        self._updateTokens(tokens)
+        self._set_token_state(TokenState.build(Tokens.from_json(response.json())))
 
     def logout(self) -> None:
         state = self._tokenState.state
@@ -362,33 +453,36 @@ class Client:
         try:
             if refreshToken is not None:
                 self.fetch(
-                    f"{self._authApi}/logout",
+                    f"{_AUTH_API}/logout",
                     method="POST",
                     data={
                         "refresh_token": refreshToken,
                     },
                 )
             else:
-                self.fetch(f"{self._authApi}/logout")
+                self.fetch(f"{_AUTH_API}/logout")
         finally:
-            self._updateTokens(None)
+            self._set_token_state(TokenState.build(None))
 
     def records(self, name: str) -> "RecordApi":
         return RecordApi(name, self)
 
-    def _updateTokens(self, tokens: Tokens | None):
-        state = TokenState.build(tokens)
+    def refresh_auth_tokens(self):
+        refreshToken = Client._shouldRefresh(self._tokenState)
+        if refreshToken is not None:
+            self._set_token_state(_refresh_tokens_impl(self._transport, refreshToken))
 
-        self._tokenState = state
+    def _set_token_state(self, tokenState: TokenState) -> TokenState:
+        self._tokenState = tokenState
 
-        state = state.state
+        state = tokenState.state
         if state is not None:
             claims = state[1]
             now = int(time())
             if claims.exp < now:
-                logger.warning("Token expired")
+                _logger.warning("Token expired")
 
-        return state
+        return tokenState
 
     @staticmethod
     def _shouldRefresh(tokenState: TokenState) -> str | None:
@@ -397,25 +491,6 @@ class Client:
         if state is not None and state[1].exp - 60 < now:
             return state[0].refresh
         return None
-
-    def _refreshTokensImpl(self, refreshToken: str) -> TokenState:
-        response = self._client.fetch(
-            f"{self._authApi}/refresh",
-            self._tokenState,
-            method="POST",
-            data={
-                "refresh_token": refreshToken,
-            },
-        )
-
-        json = response.json()
-        return TokenState.build(
-            Tokens(
-                json["auth_token"],
-                refreshToken,
-                json["csrf_token"],
-            )
-        )
 
     def fetch(
         self,
@@ -428,9 +503,11 @@ class Client:
         tokenState = self._tokenState
         refreshToken = Client._shouldRefresh(tokenState)
         if refreshToken is not None:
-            tokenState = self._tokenState = self._refreshTokensImpl(refreshToken)
+            tokenState = self._set_token_state(_refresh_tokens_impl(self._transport, refreshToken))
 
-        response = self._client.fetch(path, tokenState, method=method, data=data, queryParams=queryParams)
+        response = self._transport.fetch(
+            path, method=method, headers=tokenState.headers, queryParams=queryParams, body=data
+        )
 
         if response.status_code > 200 and throwOnError:
             raise FetchException(response.status_code, response.text)
@@ -447,12 +524,12 @@ class Client:
         tokenState = self._tokenState
         refreshToken = Client._shouldRefresh(tokenState)
         if refreshToken is not None:
-            tokenState = self._tokenState = self._refreshTokensImpl(refreshToken)
+            tokenState = self._set_token_state(_refresh_tokens_impl(self._transport, refreshToken))
 
-        return self._client.stream(
+        return self._transport.stream(
             path,
-            tokenState,
             method=method,
+            headers=tokenState.headers,
             queryParams=queryParams,
             timeout=timeout,
         )
@@ -633,22 +710,50 @@ class RecordApi:
             method="DELETE",
         )
 
-    def subscribe(self, recordId: RecordId | str | int) -> typing.Generator[JSON_OBJECT]:
+    def subscribe(self, recordId: RecordId | str | int) -> typing.Generator[EVENT]:
         id = repr(recordId) if isinstance(recordId, RecordId) else f"{recordId}"
         context = self._client.stream(
             f"{self._recordApi}/{self._name}/subscribe/{id}", timeout=httpx.Timeout(None)
         )
 
-        def impl() -> typing.Generator[JSON_OBJECT]:
+        def impl() -> typing.Generator[EVENT]:
             with context as response:
                 if response.status_code > 200:
                     raise FetchException(response.status_code, response.text)
 
                 for line in response.iter_lines():
                     if line.startswith("data: "):
-                        yield json.loads(line.rstrip("\n")[6:])
+                        ev = parseEvent(json.loads(line.rstrip("\n")[6:]))
+                        if ev is not None:
+                            yield ev
 
         return impl()
 
+    def subscribe_all(self) -> typing.Generator[EVENT]:
+        return self.subscribe("*")
 
-logger = logging.getLogger(__name__)
+
+def _refresh_tokens_impl(transport: Transport, refreshToken: str) -> TokenState:
+    response = transport.fetch(
+        f"{_AUTH_API}/refresh",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+        },
+        body={
+            "refresh_token": refreshToken,
+        },
+    )
+
+    match response.status_code:
+        case 200:
+            return TokenState.build(Tokens.from_json(response.json()))
+        case 401:
+            # Refresh token was rejected w/o means to recover. May as well log out.
+            return TokenState.build(None)
+        case _:
+            raise FetchException(response.status_code, response.text)
+
+
+_logger = logging.getLogger(__name__)
+_AUTH_API: str = "api/auth/v1"

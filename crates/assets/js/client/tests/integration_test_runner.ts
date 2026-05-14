@@ -7,13 +7,13 @@ import type { ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
 import spawn from "nano-spawn";
 
-import { ADDRESS, PORT, USE_WS } from "./constants";
+import { serverAddress, serverPort, useWebSocket } from "./setup";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function initTrailBase(): Promise<{ subprocess: ChildProcess | null }> {
-  if (PORT === 4000) {
-    // Rely on externally bootstrapped instance.
+  if (serverPort() === 4000) {
+    console.info("Skipping server-startup, relying on external instance.");
     return { subprocess: null };
   }
 
@@ -27,7 +27,7 @@ async function initTrailBase(): Promise<{ subprocess: ChildProcess | null }> {
     throw new Error(root);
   }
 
-  const features = USE_WS ? ["--features=ws"] : [];
+  const features = useWebSocket() ? ["--features=ws"] : [];
   await spawn("cargo", ["build", ...features], { cwd: root });
 
   const args = [
@@ -35,9 +35,9 @@ async function initTrailBase(): Promise<{ subprocess: ChildProcess | null }> {
     ...features,
     "--",
     "--data-dir=client/testfixture",
-    `--public-url=http://${ADDRESS}`,
+    `--public-url=http://${serverAddress()}`,
     "run",
-    `--address=${ADDRESS}`,
+    `--address=${serverAddress()}`,
     "--runtime-threads=1",
   ];
 
@@ -55,7 +55,7 @@ async function initTrailBase(): Promise<{ subprocess: ChildProcess | null }> {
     }
 
     try {
-      const response = await fetch(`http://${ADDRESS}/api/healthcheck`);
+      const response = await fetch(`http://${serverAddress()}/api/healthcheck`);
       if (response.ok) {
         return { subprocess: child };
       }
@@ -80,44 +80,49 @@ async function initTrailBase(): Promise<{ subprocess: ChildProcess | null }> {
 
 const { subprocess } = await initTrailBase();
 
-{
-  const ctx = await createVitest("test", {
-    watch: false,
-    environment: "jsdom",
-    include: ["tests/integration/*"],
-    exclude: [
-      "tests/integration/auth_integration.test.ts",
-      "tests/integration/wasm_integration.test.ts",
-    ],
-  });
+try {
+  const nodeEnvTests = (useWs: boolean) => [
+    // Auth test needs "node" environment to bring up OIDC test server.
+    "tests/integration/auth_integration.test.ts",
 
-  await ctx.start();
-  await ctx.close();
-}
+    // WebSocket test cannot run in "jsdom" environment due to `Event` collisions:
+    //   https://github.com/nodejs/undici/issues/2663#issuecomment-1936036650
+    ...(useWs ? ["tests/integration/websocket_integration.test.ts"] : []),
+  ];
 
-{
-  const ctx = await createVitest("test", {
-    watch: false,
-    environment: "node",
-    include: [
-      "tests/integration/auth_integration.test.ts",
-      "tests/integration/wasm_integration.test.ts",
-    ],
-  });
+  {
+    const ctx = await createVitest("test", {
+      watch: false,
+      environment: "jsdom",
+      include: ["tests/integration/*test.ts"],
+      exclude: nodeEnvTests(true),
+    });
 
-  await ctx.start();
-  await ctx.close();
-}
+    await ctx.start();
+    await ctx.close();
+  }
 
-if (subprocess !== null) {
-  if (subprocess.exitCode === null) {
-    // Still running
-    console.info("Shutting down TrailBase");
-    subprocess.kill();
-  } else {
-    // Otherwise TrailBase terminated. Log output to provide a clue as to why.
-    const { stderr, stdout } = subprocess;
-    console.error(stdout);
-    console.error(stderr);
+  {
+    const ctx = await createVitest("test", {
+      watch: false,
+      environment: "node",
+      include: nodeEnvTests(useWebSocket()),
+    });
+
+    await ctx.start();
+    await ctx.close();
+  }
+} finally {
+  if (subprocess !== null) {
+    if (subprocess.exitCode === null) {
+      // Still running
+      console.info("Shutting down TrailBase");
+      subprocess.kill();
+    } else {
+      // Otherwise TrailBase terminated. Log output to provide a clue as to why.
+      const { stderr, stdout } = subprocess;
+      console.error(stdout);
+      console.error(stderr);
+    }
   }
 }

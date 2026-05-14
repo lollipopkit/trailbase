@@ -1,21 +1,54 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-  #[error("Connection closed error")]
+  #[error("ConnectionClosed")]
   ConnectionClosed,
 
-  /// An error occured while closing the SQLite connection.
-  /// This `Error` variant contains the [`Connection`], which can be used to retry the close
-  /// operation and the underlying [`rusqlite::Error`] that made it impossible to close the
-  /// database.
-  #[error("Close error: {0}")]
-  Close(rusqlite::Error),
+  #[error("NotSupported")]
+  NotSupported,
 
-  #[error("Rusqlite error: {0}")]
+  /// Error when the value of a particular column is requested, but the type
+  /// of the result in that column cannot be converted to the requested
+  /// Rust type.
+  #[error("InvalidColumnType({idx}, {name}, {decl_type:?})")]
+  InvalidColumnType {
+    idx: usize,
+    name: String,
+    decl_type: Option<crate::rows::ValueType>,
+  },
+
+  #[error("ExecuteReturnedResults")]
+  ExecuteReturnedResults,
+
+  #[error("FromSql: {0}")]
+  FromSql(#[from] crate::from_sql::FromSqlError),
+
+  // QUESTION: This is leaky. How often do downstream users have to introspect on this
+  // rusqlite::Error. Otherwise, should/could this be more opaue.
+  #[error("Rusqlite: {0}")]
   Rusqlite(#[from] rusqlite::Error),
 
-  #[error("SerdeRusqlite error: {0}")]
-  SerdeRusqlite(#[from] serde_rusqlite::Error),
+  // QUESTION: This is leaky. How often do downstream users have to introspect on this
+  // rusqlite::Error. Otherwise, should/could this be more opaue.
+  #[cfg(feature = "pg")]
+  #[error("Posgres: {0}")]
+  Postgres(#[from] postgres::Error),
 
-  #[error("Other error: {0}")]
+  #[error("DeserializeValue: {0}")]
+  DeserializeValue(serde_rusqlite::Error),
+
+  /// This one is useful for downstream consumers providing a `Connection` builder returning this
+  /// error.
+  #[error("Other: {0}")]
   Other(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+pub fn unpack_other_error<T>(err: Error) -> Result<T, Error>
+where
+  T: std::error::Error + Send + Sync + 'static,
+{
+  return match err {
+    // Try to downcast and otherwise repackage.
+    Error::Other(err) => Ok(*err.downcast::<T>().map_err(Error::Other)?),
+    err => Err(err),
+  };
 }

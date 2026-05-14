@@ -27,6 +27,9 @@ pub struct UserJson {
   // For external oauth providers.
   pub provider_id: i64,
   pub provider_user_id: Option<String>,
+
+  pub created: i64,
+  pub updated: i64,
 }
 
 impl From<DbUser> for UserJson {
@@ -38,6 +41,8 @@ impl From<DbUser> for UserJson {
       admin: value.admin,
       provider_id: value.provider_id,
       provider_user_id: value.provider_user_id,
+      created: value.created,
+      updated: value.updated,
     }
   }
 }
@@ -81,13 +86,13 @@ pub async fn list_users_handler(
     build_filter_where_clause("_ROW_", &table_metadata.column_metadata, filter_params)?;
 
   let total_row_count: i64 = conn
-    .read_query_row_f(
+    .read_query_row_get(
       format!(
         "SELECT COUNT(*) FROM {USER_TABLE} AS _ROW_ WHERE {where_clause}",
         where_clause = filter_where_clause.clause
       ),
       filter_where_clause.params.clone(),
-      |row| row.get(0),
+      0,
     )
     .await?
     .unwrap_or(-1);

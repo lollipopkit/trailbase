@@ -115,6 +115,15 @@ pub async fn create_record_handler(
       }
     }
 
+    #[cfg(debug_assertions)]
+    crate::records::json_schema::validate_api_json_schema(
+      &state,
+      &api,
+      trailbase_schema::json_schema::JsonSchemaMode::Update,
+      &serde_json::Value::Object(record.clone()),
+    )
+    .map_err(|_err| RecordError::BadRequest("Invalid Parameters"))?;
+
     let mut lazy_params =
       LazyParams::for_insert(&api, state.json_schema_registry().clone(), record, files);
 
@@ -188,11 +197,11 @@ pub async fn create_record_handler(
 }
 
 #[inline]
-fn extract_record_id(value: rusqlite::types::Value) -> Result<String, trailbase_sqlite::Error> {
+fn extract_record_id(value: trailbase_sqlite::Value) -> Result<String, trailbase_sqlite::Error> {
   return match value {
-    rusqlite::types::Value::Blob(blob) => Ok(BASE64_URL_SAFE.encode(blob)),
-    rusqlite::types::Value::Text(text) => Ok(text),
-    rusqlite::types::Value::Integer(i) => Ok(i.to_string()),
+    trailbase_sqlite::Value::Blob(blob) => Ok(BASE64_URL_SAFE.encode(blob)),
+    trailbase_sqlite::Value::Text(text) => Ok(text),
+    trailbase_sqlite::Value::Integer(i) => Ok(i.to_string()),
     _ => Err(trailbase_sqlite::Error::Other(
       "Unexpected data type".into(),
     )),
@@ -425,7 +434,7 @@ mod test {
       // Bulk inserts are rolled back in a transaction is second insert fails.
       let count_before: i64 = state
         .conn()
-        .read_query_row_f("SELECT COUNT(*) FROM message", (), |row| row.get(0))
+        .read_query_row_get("SELECT COUNT(*) FROM message", (), 0)
         .await
         .unwrap()
         .unwrap();
@@ -451,7 +460,7 @@ mod test {
 
       let count_after: i64 = state
         .conn()
-        .read_query_row_f("SELECT COUNT(*) FROM message", (), |row| row.get(0))
+        .read_query_row_get("SELECT COUNT(*) FROM message", (), 0)
         .await
         .unwrap()
         .unwrap();

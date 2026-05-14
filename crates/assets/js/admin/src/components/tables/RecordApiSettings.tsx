@@ -54,7 +54,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   buildTextFormField,
-  buildOptionalTextFormField,
+  buildOptionalTextAreaFormField,
 } from "@/components/FormFields";
 
 import {
@@ -176,13 +176,13 @@ interface AccessRule {
 const tableAccessRules: AccessRule[] = [
   {
     field: "readAccessRule",
-    label: "Read Access:",
+    label: "Read Access",
     description:
       'Row- and request-level read access (_user_, _row_, _req_): If the table has an "owner"\'s column containing binary user ids, access could be rstricted to the owner by setting \'_row_.owner = _user_\' here. Or if the table as a foreign key to a "group" and a relationship defined in a "membership" table: \'(SELECT 1 FROM membership WHERE group = _row_.group AND user = _user_)\'',
   },
   {
     field: "createAccessRule",
-    label: "Create Access:",
+    label: "Create Access",
     description:
       "Request-level create access validation base on _USER_, _REQ_:",
   },
@@ -514,17 +514,7 @@ function AddApiDialog(props: {
   setApi: (api: RecordApiConfig) => void;
 }) {
   const [open, setOpen] = createSignal(false);
-  const [name, setName] = createSignal<string>(props.defaultApiName);
-
-  const confirm = () => {
-    const n = name();
-    if (n !== "") {
-      props.setApi(
-        newRecordApiDefault({ tableName: props.tableName, apiName: name() }),
-      );
-      setOpen(false);
-    }
-  };
+  let name: HTMLInputElement | undefined;
 
   return (
     <Dialog
@@ -538,36 +528,45 @@ function AddApiDialog(props: {
 
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add New API</DialogTitle>
+          <DialogTitle>New API</DialogTitle>
         </DialogHeader>
 
-        <TextField class="flex items-center gap-2">
-          <TextFieldLabel class="w-[100px]">API Name</TextFieldLabel>
+        <form
+          class="flex flex-col gap-4"
+          method="dialog"
+          onSubmit={(e: SubmitEvent) => {
+            e.preventDefault();
 
-          <TextFieldInput
-            type={"text"}
-            value={name()}
-            placeholder={"API Name"}
-            onKeyUp={(e: KeyboardEvent) => {
-              if (e.key === "Enter") {
-                confirm();
-              }
-            }}
-            onInput={(e: Event) => {
-              setName((e.target as HTMLInputElement).value);
-            }}
-          />
-        </TextField>
+            const n = name?.value;
+            if (n) {
+              props.setApi(
+                newRecordApiDefault({ tableName: props.tableName, apiName: n }),
+              );
+              setOpen(false);
+            }
+          }}
+        >
+          <TextField class="flex items-center gap-2">
+            <TextFieldLabel class="w-[100px]">API Name</TextFieldLabel>
 
-        <DialogFooter>
-          <div class="flex w-full justify-between gap-2">
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Abort
-            </Button>
+            <TextFieldInput
+              ref={name}
+              type={"text"}
+              placeholder={"API Name"}
+              pattern="[a-zA-Z0-9_]+"
+            />
+          </TextField>
 
-            <Button onClick={confirm}>Add</Button>
-          </div>
-        </DialogFooter>
+          <DialogFooter>
+            <div class="flex w-full justify-between gap-2">
+              <Button variant="outline" onClick={() => setOpen(false)}>
+                Abort
+              </Button>
+
+              <Button type="submit">Add</Button>
+            </div>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );
@@ -619,6 +618,7 @@ export function RecordApiSettingsForm(props: {
               api,
               mode: Mode.Create,
             });
+            props.markDirty(true);
           }}
         />
 
@@ -626,7 +626,12 @@ export function RecordApiSettingsForm(props: {
           multiple={false}
           placeholder="Select API..."
           value={(() => {
-            const name = api()?.api.name;
+            const current = api();
+            const name = current?.api.name;
+            if (current == undefined || !name) {
+              return undefined;
+            }
+
             for (const api of existingApis()) {
               if (api.name === name) {
                 return name;
@@ -679,6 +684,7 @@ export function RecordApiSettingsForm(props: {
               } else {
                 // API removed, either working copy discarded or existing deleted.
                 setApi(undefined);
+                props.markDirty(false);
               }
             }}
             {...props}
@@ -738,7 +744,6 @@ function IndividualRecordApiSettingsForm(props: {
             variant: "success",
           });
           props.reset(value);
-          props.markDirty(false);
         } catch (err) {
           showToast({
             title: `${isCreate ? "Creation" : "Update"} Error`,
@@ -1154,10 +1159,10 @@ function IndividualRecordApiSettingsForm(props: {
                           onChangeAsyncDebounceMs: 500,
                         }}
                       >
-                        {buildOptionalTextFormField({
-                          label: () => (
-                            <div class="w-[112px]">{item.label}</div>
-                          ),
+                        {buildOptionalTextAreaFormField({
+                          class: "font-mono whitespace-nowrap overflow-y-auto",
+                          label: () => <div class="w-[60px]">{item.label}</div>,
+                          rows: 5,
                         })}
                       </form.Field>
                     );

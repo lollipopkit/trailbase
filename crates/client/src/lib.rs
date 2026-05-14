@@ -14,6 +14,7 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::borrow::Cow;
 use std::sync::Arc;
 use thiserror::Error;
@@ -26,9 +27,6 @@ pub use futures_lite::Stream;
 pub enum Error {
   #[error("HTTP status: {0}")]
   HttpStatus(StatusCode),
-
-  #[error("MissingRefreshToken")]
-  MissingRefreshToken,
 
   #[error("RecordSerialization: {0}")]
   RecordSerialization(serde_json::Error),
@@ -107,12 +105,43 @@ impl Pagination {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum DbEvent {
-  Update(Option<serde_json::Value>),
-  Insert(Option<serde_json::Value>),
-  Delete(Option<serde_json::Value>),
-  Error(String),
+type JsonObject = serde_json::value::Map<String, serde_json::Value>;
+
+#[derive(Debug, Clone, Copy, Deserialize_repr, Serialize_repr, PartialEq)]
+#[repr(i64)]
+pub enum EventErrorStatus {
+  /// Unknown or unspecified error.
+  Unknown = 0,
+  /// Access forbidden.
+  Forbidden = 1,
+  /// Server-side event-loss, e.g. a buffer ran out of capacity. This does not account for
+  /// additional losses that may happen between the TrailBase server and the client. This
+  /// needs to be determined client-side based on event `seq` numbers.
+  Loss = 2,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub enum EventPayload {
+  Update(JsonObject),
+  Insert(JsonObject),
+  Delete(JsonObject),
+  Error {
+    status: EventErrorStatus,
+    message: Option<String>,
+  },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ChangeEvent {
+  #[serde(flatten)]
+  pub event: Arc<EventPayload>,
+  pub seq: Option<i64>,
+}
+
+impl ChangeEvent {
+  fn from_str(msg: &str) -> Result<ChangeEvent, serde_json::Error> {
+    return serde_json::from_str::<ChangeEvent>(msg);
+  }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -192,20 +221,51 @@ impl<'a, T: RecordId<'a>> ReadArgumentsTrait<'a> for ReadArguments<'a, T> {
   }
 }
 
-struct ThinClient {
-  client: reqwest::Client,
-  url: url::Url,
-}
-
-impl ThinClient {
-  async fn fetch_impl<T: Serialize>(
+#[async_trait::async_trait]
+pub trait Transport {
+  async fn fetch(
     &self,
     path: &str,
     headers: HeaderMap,
     method: Method,
-    body: Option<&T>,
+    body: Option<Vec<u8>>,
     query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
-  ) -> Result<reqwest::Response, Error> {
+  ) -> Result<http::Response<reqwest::Body>, Error>;
+
+  #[cfg(feature = "ws")]
+  async fn upgrade_ws(
+    &self,
+    path: &str,
+    headers: HeaderMap,
+    method: Method,
+    query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
+  ) -> Result<reqwest_websocket::UpgradeResponse, Error>;
+}
+
+pub struct DefaultTransport {
+  client: reqwest::Client,
+  url: url::Url,
+}
+
+impl DefaultTransport {
+  pub fn new(url: url::Url) -> Self {
+    return Self {
+      client: reqwest::Client::new(),
+      url,
+    };
+  }
+}
+
+#[async_trait::async_trait]
+impl Transport for DefaultTransport {
+  async fn fetch(
+    &self,
+    path: &str,
+    headers: HeaderMap,
+    method: Method,
+    body: Option<Vec<u8>>,
+    query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
+  ) -> Result<http::Response<reqwest::Body>, Error> {
     assert!(path.starts_with("/"));
 
     let mut url = self.url.clone();
@@ -220,23 +280,23 @@ impl ThinClient {
 
     let request = {
       let mut builder = self.client.request(method, url).headers(headers);
-      if let Some(ref body) = body {
-        let json = serde_json::to_string(body).map_err(Error::RecordSerialization)?;
-        builder = builder.body(json);
+      if let Some(body) = body {
+        // let json = serde_json::to_string(body).map_err(Error::RecordSerialization)?;
+        // builder = builder.body(json);
+        builder = builder.body(body);
       }
       builder.build()?
     };
 
-    return Ok(self.client.execute(request).await?);
+    return Ok(self.client.execute(request).await?.into());
   }
 
   #[cfg(feature = "ws")]
-  async fn upgrade_ws_impl<T: Serialize>(
+  async fn upgrade_ws(
     &self,
     path: &str,
     headers: HeaderMap,
     method: Method,
-    body: Option<&T>,
     query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
   ) -> Result<reqwest_websocket::UpgradeResponse, Error> {
     use reqwest_websocket::Upgrade;
@@ -253,16 +313,15 @@ impl ThinClient {
       }
     }
 
-    let request = {
-      let mut builder = self.client.request(method, url).headers(headers);
-      if let Some(ref body) = body {
-        let json = serde_json::to_string(body).map_err(Error::RecordSerialization)?;
-        builder = builder.body(json);
-      }
-      builder.upgrade()
-    };
-
-    return Ok(request.send().await?);
+    return Ok(
+      self
+        .client
+        .request(method, url)
+        .headers(headers)
+        .upgrade()
+        .send()
+        .await?,
+    );
   }
 }
 
@@ -482,7 +541,7 @@ impl RecordApi {
       .fetch(
         &format!("/{RECORD_API}/{}", self.name),
         Method::GET,
-        None::<&()>,
+        None,
         Some(&params),
         /* error_for_status= */ true,
       )
@@ -508,7 +567,7 @@ impl RecordApi {
           id = args.serialized_id()
         ),
         Method::GET,
-        None::<&()>,
+        None,
         expand.as_deref(),
         /* error_for_status= */ true,
       )
@@ -531,7 +590,7 @@ impl RecordApi {
       .fetch(
         &format!("/{RECORD_API}/{name}", name = self.name),
         Method::POST,
-        Some(&record),
+        Some(serde_json::to_vec(&record).map_err(Error::RecordSerialization)?),
         None,
         /* error_for_status= */ true,
       )
@@ -559,7 +618,7 @@ impl RecordApi {
           id = id.serialized_id()
         ),
         Method::PATCH,
-        Some(&record),
+        Some(serde_json::to_vec(&record).map_err(Error::RecordSerialization)?),
         None,
         /* error_for_status= */ true,
       )
@@ -578,7 +637,7 @@ impl RecordApi {
           id = id.serialized_id()
         ),
         Method::DELETE,
-        None::<&()>,
+        None,
         None,
         /* error_for_status= */ true,
       )
@@ -590,7 +649,7 @@ impl RecordApi {
   pub async fn subscribe<'a, T: RecordId<'a>>(
     &self,
     id: T,
-  ) -> Result<impl Stream<Item = DbEvent> + use<T>, Error> {
+  ) -> Result<impl Stream<Item = ChangeEvent> + use<T>, Error> {
     // TODO: Might have to add HeaderValue::from_static("text/event-stream").
     let response = self
       .client
@@ -601,21 +660,25 @@ impl RecordApi {
           id = id.serialized_id()
         ),
         Method::GET,
-        None::<&()>,
+        None,
         None,
         /* error_for_status= */ true,
       )
       .await?;
 
     return Ok(
-      response
-        .bytes_stream()
+      http_body_util::BodyDataStream::new(response.into_body())
         .eventsource()
         .filter_map(|event_or| {
-          // QUESTION: Should we instead return a `Stream<Item = Result<DbEvent, _>>` to allow for
-          // better error handling here.
+          // QUESTION: Should we instead return a `Stream<Item = Result<ChangeEvent, _>>` to allow
+          // for better error handling here.
           if let Ok(event) = event_or {
-            return serde_json::from_str::<DbEvent>(&event.data).ok();
+            return ChangeEvent::from_str(&event.data)
+              .map_err(|err| {
+                warn!("Failed to parse change event: {}", event.data);
+                return err;
+              })
+              .ok();
           }
           return None;
         }),
@@ -626,7 +689,7 @@ impl RecordApi {
   pub async fn subscribe_ws<'a, T: RecordId<'a>>(
     &self,
     id: T,
-  ) -> Result<impl Stream<Item = DbEvent> + use<T>, Error> {
+  ) -> Result<impl Stream<Item = ChangeEvent> + use<T>, Error> {
     let response = self
       .client
       .upgrade_ws(
@@ -636,7 +699,6 @@ impl RecordApi {
           id = id.serialized_id()
         ),
         Method::GET,
-        None::<&()>,
         Some(&[("ws".into(), "true".into())]),
       )
       .await?;
@@ -647,7 +709,7 @@ impl RecordApi {
       use reqwest_websocket::Message;
 
       return match message {
-        Ok(Message::Text(msg)) => serde_json::from_str::<DbEvent>(&msg)
+        Ok(Message::Text(msg)) => serde_json::from_str::<ChangeEvent>(&msg)
           .map_err(|err| {
             warn!("json error: {err}");
             return err;
@@ -687,60 +749,59 @@ impl TokenState {
 }
 
 struct ClientState {
-  client: ThinClient,
-  site: String,
+  transport: Box<dyn Transport + Send + Sync>,
+  base_url: url::Url,
   tokens: RwLock<TokenState>,
 }
 
 impl ClientState {
   #[inline]
-  async fn fetch<T: Serialize>(
+  async fn fetch(
     &self,
     path: &str,
     method: Method,
-    body: Option<&T>,
+    body: Option<Vec<u8>>,
     query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
     error_for_status: bool,
-  ) -> Result<reqwest::Response, Error> {
+  ) -> Result<http::Response<reqwest::Body>, Error> {
     let (mut headers, refresh_token) = self.extract_headers_and_refresh_token_if_exp();
     if let Some(refresh_token) = refresh_token {
-      let new_tokens = ClientState::refresh_tokens(&self.client, headers, refresh_token).await?;
+      let new_tokens = refresh_tokens_impl(&*self.transport, headers, refresh_token).await?;
 
       headers = new_tokens.headers.clone();
       *self.tokens.write() = new_tokens;
     }
 
     let response = self
-      .client
-      .fetch_impl(path, headers, method, body, query_params)
+      .transport
+      .fetch(path, headers, method, body, query_params)
       .await?;
 
     if error_for_status {
-      return Ok(response.error_for_status()?);
+      return error_for_status_unpack(response);
     }
     return Ok(response);
   }
 
   #[cfg(feature = "ws")]
   #[inline]
-  async fn upgrade_ws<T: Serialize>(
+  async fn upgrade_ws(
     &self,
     path: &str,
     method: Method,
-    body: Option<&T>,
     query_params: Option<&[(Cow<'static, str>, Cow<'static, str>)]>,
   ) -> Result<reqwest_websocket::UpgradeResponse, Error> {
     let (mut headers, refresh_token) = self.extract_headers_and_refresh_token_if_exp();
     if let Some(refresh_token) = refresh_token {
-      let new_tokens = ClientState::refresh_tokens(&self.client, headers, refresh_token).await?;
+      let new_tokens = refresh_tokens_impl(&*self.transport, headers, refresh_token).await?;
 
       headers = new_tokens.headers.clone();
       *self.tokens.write() = new_tokens;
     }
 
     return self
-      .client
-      .upgrade_ws_impl(path, headers, method, body, query_params)
+      .transport
+      .upgrade_ws(path, headers, method, query_params)
       .await;
   }
 
@@ -768,42 +829,6 @@ impl ClientState {
     }
     return None;
   }
-
-  async fn refresh_tokens(
-    client: &ThinClient,
-    headers: HeaderMap,
-    refresh_token: String,
-  ) -> Result<TokenState, Error> {
-    #[derive(Serialize)]
-    struct RefreshRequest<'a> {
-      refresh_token: &'a str,
-    }
-
-    let response = client
-      .fetch_impl(
-        &format!("/{AUTH_API}/refresh"),
-        headers,
-        Method::POST,
-        Some(&RefreshRequest {
-          refresh_token: &refresh_token,
-        }),
-        None,
-      )
-      .await?;
-
-    #[derive(Deserialize)]
-    struct RefreshResponse {
-      auth_token: String,
-      csrf_token: Option<String>,
-    }
-
-    let refresh_response: RefreshResponse = json(response).await?;
-    return Ok(TokenState::build(Some(&Tokens {
-      auth_token: refresh_response.auth_token,
-      refresh_token: Some(refresh_token),
-      csrf_token: refresh_response.csrf_token,
-    })));
-  }
 }
 
 #[derive(Clone)]
@@ -811,22 +836,32 @@ pub struct Client {
   state: Arc<ClientState>,
 }
 
+#[derive(Default)]
+pub struct ClientOptions {
+  pub tokens: Option<Tokens>,
+  pub transport: Option<Box<dyn Transport + Send + Sync>>,
+}
+
 impl Client {
-  pub fn new(site: &str, tokens: Option<Tokens>) -> Result<Client, Error> {
+  pub fn new(
+    base_url: impl TryInto<url::Url, Error = url::ParseError>,
+    opts: Option<ClientOptions>,
+  ) -> Result<Client, Error> {
+    let opts = opts.unwrap_or_default();
+    let base_url = base_url.try_into().map_err(Error::InvalidUrl)?;
     return Ok(Client {
       state: Arc::new(ClientState {
-        client: ThinClient {
-          client: reqwest::Client::new(),
-          url: url::Url::parse(site).map_err(Error::InvalidUrl)?,
-        },
-        site: site.to_string(),
-        tokens: RwLock::new(TokenState::build(tokens.as_ref())),
+        transport: opts.transport.unwrap_or_else(|| {
+          return Box::new(DefaultTransport::new(base_url.clone()));
+        }),
+        base_url,
+        tokens: RwLock::new(TokenState::build(opts.tokens.as_ref())),
       }),
     });
   }
 
-  pub fn site(&self) -> String {
-    return self.state.site.clone();
+  pub fn base_url(&self) -> &url::Url {
+    return &self.state.base_url;
   }
 
   pub fn tokens(&self) -> Option<Tokens> {
@@ -852,11 +887,11 @@ impl Client {
 
   pub async fn refresh(&self) -> Result<(), Error> {
     let Some((headers, refresh_token)) = self.state.extract_headers_refresh_token() else {
-      return Err(Error::MissingRefreshToken);
+      // Not logged in - nothing to do.
+      return Ok(());
     };
 
-    let new_tokens =
-      ClientState::refresh_tokens(&self.state.client, headers, refresh_token).await?;
+    let new_tokens = refresh_tokens_impl(&*self.state.transport, headers, refresh_token).await?;
 
     *self.state.tokens.write() = new_tokens;
     return Ok(());
@@ -878,7 +913,10 @@ impl Client {
       .fetch(
         &format!("/{AUTH_API}/login"),
         Method::POST,
-        Some(&Credentials { email, password }),
+        Some(
+          serde_json::to_vec(&Credentials { email, password })
+            .map_err(Error::RecordSerialization)?,
+        ),
         None,
         /* error_for_status= */ false,
       )
@@ -889,7 +927,7 @@ impl Client {
       return Ok(Some(mfa_token));
     }
 
-    let tokens: Tokens = json(response.error_for_status()?).await?;
+    let tokens: Tokens = json(error_for_status_unpack(response)?).await?;
     self.update_tokens(Some(&tokens));
 
     return Ok(None);
@@ -911,16 +949,19 @@ impl Client {
       .fetch(
         &format!("/{AUTH_API}/login_mfa"),
         Method::POST,
-        Some(&Credentials {
-          mfa_token: &mfa_token.mfa_token,
-          totp: totp_code,
-        }),
+        Some(
+          serde_json::to_vec(&Credentials {
+            mfa_token: &mfa_token.mfa_token,
+            totp: totp_code,
+          })
+          .map_err(Error::RecordSerialization)?,
+        ),
         None,
         /* error_for_status= */ true,
       )
       .await?;
 
-    let tokens: Tokens = json(response.error_for_status()?).await?;
+    let tokens: Tokens = json(error_for_status_unpack(response)?).await?;
     self.update_tokens(Some(&tokens));
 
     return Ok(());
@@ -938,10 +979,13 @@ impl Client {
       .fetch(
         &format!("/{AUTH_API}/otp/request"),
         Method::POST,
-        Some(&Credentials {
-          email,
-          redirect_uri,
-        }),
+        Some(
+          serde_json::to_vec(&Credentials {
+            email,
+            redirect_uri,
+          })
+          .map_err(Error::RecordSerialization)?,
+        ),
         None,
         /* error_for_status= */ true,
       )
@@ -962,13 +1006,13 @@ impl Client {
       .fetch(
         &format!("/{AUTH_API}/otp/login"),
         Method::POST,
-        Some(&Credentials { email, code }),
+        Some(serde_json::to_vec(&Credentials { email, code }).map_err(Error::RecordSerialization)?),
         None,
         /* error_for_status= */ true,
       )
       .await?;
 
-    let tokens: Tokens = json(response.error_for_status()?).await?;
+    let tokens: Tokens = json(error_for_status_unpack(response)?).await?;
     self.update_tokens(Some(&tokens));
 
     return Ok(());
@@ -987,7 +1031,10 @@ impl Client {
           .fetch(
             &format!("/{AUTH_API}/logout"),
             Method::POST,
-            Some(&LogoutRequest { refresh_token }),
+            Some(
+              serde_json::to_vec(&LogoutRequest { refresh_token })
+                .map_err(Error::RecordSerialization)?,
+            ),
             None,
             /* error_for_status= */ true,
           )
@@ -999,7 +1046,7 @@ impl Client {
           .fetch(
             &format!("/{AUTH_API}/logout"),
             Method::GET,
-            None::<&()>,
+            None,
             None,
             /* error_for_status= */ true,
           )
@@ -1063,6 +1110,53 @@ fn build_headers(tokens: Option<&Tokens>) -> HeaderMap {
   return base;
 }
 
+async fn refresh_tokens_impl(
+  transport: &(dyn Transport + Send + Sync),
+  headers: HeaderMap,
+  refresh_token: String,
+) -> Result<TokenState, Error> {
+  #[derive(Serialize)]
+  struct RefreshRequest<'a> {
+    refresh_token: &'a str,
+  }
+
+  // NOTE: Do not use `ClientState::fetch`, which may do token refreshing to avoid loops.
+  let response = transport
+    .fetch(
+      &format!("/{AUTH_API}/refresh"),
+      headers,
+      Method::POST,
+      Some(
+        serde_json::to_vec(&RefreshRequest {
+          refresh_token: &refresh_token,
+        })
+        .map_err(Error::RecordSerialization)?,
+      ),
+      None,
+    )
+    .await?;
+
+  return match response.status() {
+    StatusCode::OK => {
+      #[derive(Deserialize)]
+      struct RefreshResponse {
+        auth_token: String,
+        csrf_token: Option<String>,
+      }
+
+      let refresh_response: RefreshResponse = json(response).await?;
+
+      Ok(TokenState::build(Some(&Tokens {
+        auth_token: refresh_response.auth_token,
+        refresh_token: Some(refresh_token),
+        csrf_token: refresh_response.csrf_token,
+      })))
+    }
+    StatusCode::UNAUTHORIZED => Ok(TokenState::build(None)),
+    status => Err(Error::HttpStatus(status)),
+  };
+}
+
 fn now() -> u64 {
   return std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
@@ -1071,9 +1165,28 @@ fn now() -> u64 {
 }
 
 #[inline]
-async fn json<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, Error> {
-  let full = resp.bytes().await?;
+async fn json<T: DeserializeOwned>(resp: http::Response<reqwest::Body>) -> Result<T, Error> {
+  let full = into_bytes(resp).await?;
   return serde_json::from_slice(&full).map_err(Error::RecordSerialization);
+}
+
+#[inline]
+async fn into_bytes(resp: http::Response<reqwest::Body>) -> Result<bytes::Bytes, Error> {
+  return Ok(
+    http_body_util::BodyExt::collect(resp.into_body())
+      .await
+      .map(|buf| buf.to_bytes())?,
+  );
+}
+
+fn error_for_status_unpack(
+  resp: http::Response<reqwest::Body>,
+) -> Result<http::Response<reqwest::Body>, Error> {
+  let status = resp.status();
+  if status.is_client_error() || status.is_server_error() {
+    return Err(Error::HttpStatus(status));
+  }
+  return Ok(resp);
 }
 
 const AUTH_API: &str = "api/auth/v1";
@@ -1099,5 +1212,52 @@ mod tests {
       .await
       .unwrap();
     }
+  }
+
+  #[test]
+  fn parse_change_event_test() {
+    let ev0 = ChangeEvent::from_str(
+      r#"
+        {
+          "Error": {
+            "status": 1,
+            "message": "test"
+          },
+          "seq": 3
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(ev0.seq, Some(3));
+    let EventPayload::Error { status, message } = &*ev0.event else {
+      panic!("expected error payload, got {:?}", ev0.event);
+    };
+
+    assert_eq!(*status, EventErrorStatus::Forbidden);
+    assert_eq!(message.as_deref().unwrap(), "test");
+
+    let ev1 = ChangeEvent::from_str(
+      r#"
+        {
+          "Update": {
+            "col0": "val0",
+            "col1": 4
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(ev1.seq, None);
+    let EventPayload::Update(obj) = &*ev1.event else {
+      panic!("expected update payload, got {:?}", ev1.event);
+    };
+
+    assert_eq!(
+      serde_json::Value::Object(obj.clone()),
+      serde_json::json!({
+          "col0": "val0",
+          "col1": 4,
+      })
+    )
   }
 }

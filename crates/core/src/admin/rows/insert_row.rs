@@ -32,7 +32,10 @@ pub async fn insert_row_handler(
   let ConnectionEntry {
     connection: conn,
     metadata,
-  } = state.connection_manager().get_entry_for_qn(&table_name)?;
+  } = state
+    .connection_manager()
+    .get_entry_for_qn(&table_name)
+    .await?;
 
   let Some(table_metadata) = metadata.get_table(&table_name) else {
     return Err(Error::Precondition(format!(
@@ -53,9 +56,63 @@ pub async fn insert_row_handler(
   .await?;
 
   return match rowid_value {
-    rusqlite::types::Value::Integer(rowid) => Ok(Json(InsertRowResponse { row_id: rowid })),
+    trailbase_sqlite::Value::Integer(rowid) => Ok(Json(InsertRowResponse { row_id: rowid })),
     _ => Err(Error::Internal(
       format!("unexpected return type: {rowid_value:?}").into(),
     )),
   };
+}
+
+#[cfg(test)]
+mod tests {
+  #[cfg(any(feature = "geos", feature = "geos-static"))]
+  #[tokio::test]
+  async fn admin_insert_geometry_test() {
+    use super::*;
+
+    let state = crate::app_state::test_state(None).await.unwrap();
+    let conn = state.conn();
+
+    conn
+      .execute_batch(
+        "
+         CREATE TABLE IF NOT EXISTS geom_table (
+             id       INTEGER PRIMARY KEY,
+             geom     BLOB CHECK(ST_IsValid(geom))
+         ) STRICT;
+        ",
+      )
+      .await
+      .unwrap();
+
+    state.rebuild_connection_metadata().await.unwrap();
+
+    let wkb_geometry: Vec<u8> = {
+      use geos::Geom;
+
+      let coords = geos::CoordSeq::new_from_vec(&[&[12.4924, 41.8902]]).unwrap();
+      let geometry = geos::Geometry::create_point(coords).unwrap();
+      geometry.to_wkb().unwrap()
+    };
+
+    let request = InsertRowRequest {
+      row: indexmap::IndexMap::from([
+        ("id".to_string(), SqlValue::Integer(3)),
+        (
+          "geom".to_string(),
+          SqlValue::Blob(trailbase_sqlvalue::Blob::Array(wkb_geometry)),
+        ),
+      ]),
+    };
+
+    let Json(response) = insert_row_handler(
+      State(state.clone()),
+      Path("geom_table".into()),
+      Json(request),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(3, response.row_id);
+  }
 }

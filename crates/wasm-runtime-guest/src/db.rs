@@ -2,35 +2,55 @@ use trailbase_sqlvalue::{Blob, DecodeError, SqlValue};
 use wstd::http::body::IntoBody;
 use wstd::http::{Client, Request};
 
-use crate::wit::trailbase::database::sqlite::{
-  tx_begin, tx_commit, tx_execute, tx_query, tx_rollback,
-};
+use crate::wit::trailbase::database::sqlite::Transaction as WasiTransaction;
 
 pub use crate::wit::trailbase::database::sqlite::{TxError, Value};
 pub use trailbase_wasm_common::{SqliteRequest, SqliteResponse};
 
+/// Escapes arbitrary strings as a safe SQL string literal, e.g. 'foo'.
+pub fn escape(s: impl AsRef<str>) -> String {
+  let input = s.as_ref();
+  let mut buf = String::with_capacity(input.len() * 2 + 2);
+
+  buf.push('\'');
+  for b in input.chars() {
+    match b {
+      '\'' => buf.push_str("''"),
+      // Not strictly an injection risk, just being defensive here for downstream consumers.
+      '\0' => buf.push_str("\\0"),
+      _ => buf.push(b),
+    }
+  }
+  buf.push('\'');
+
+  return buf;
+}
+
 pub struct Transaction {
+  tx: WasiTransaction,
   committed: bool,
 }
 
 impl Transaction {
   pub fn begin() -> Result<Self, TxError> {
-    tx_begin()?;
-    return Ok(Self { committed: false });
+    return Ok(Self {
+      tx: WasiTransaction::new(),
+      committed: false,
+    });
   }
 
   pub fn query(&mut self, query: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, TxError> {
-    return tx_query(query, params);
+    return self.tx.query(query, params);
   }
 
   pub fn execute(&mut self, query: &str, params: &[Value]) -> Result<u64, TxError> {
-    return tx_execute(query, params);
+    return self.tx.execute(query, params);
   }
 
   pub fn commit(&mut self) -> Result<(), TxError> {
     if !self.committed {
       self.committed = true;
-      tx_commit()?;
+      self.tx.commit()?;
     }
     return Ok(());
   }
@@ -39,7 +59,7 @@ impl Transaction {
 impl Drop for Transaction {
   fn drop(&mut self) {
     if !self.committed
-      && let Err(err) = tx_rollback()
+      && let Err(err) = self.tx.rollback()
     {
       log::warn!("TX rollback failed: {err}");
     }
@@ -47,15 +67,26 @@ impl Drop for Transaction {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-  #[error("Unexpected Type")]
-  UnexpectedType,
-  #[error("Not a Number")]
-  NotANumber,
-  #[error("Decoding")]
-  Decoding(#[from] DecodeError),
+  #[error("Unexpected Type: {0}")]
+  UnexpectedType(Box<dyn std::error::Error>),
+  #[error("Decoding: {0}")]
+  Decoding(Box<dyn std::error::Error>),
   #[error("Other: {0}")]
-  Other(String),
+  Other(Box<dyn std::error::Error>),
+}
+
+impl From<DecodeError> for Error {
+  fn from(err: DecodeError) -> Self {
+    return Self::Decoding(err.into());
+  }
+}
+
+impl From<serde_json::Error> for Error {
+  fn from(err: serde_json::Error) -> Self {
+    return Self::Decoding(err.into());
+  }
 }
 
 pub async fn query(
@@ -69,24 +100,17 @@ pub async fn query(
   let request = Request::builder()
     .uri("http://__sqlite/query")
     .method("POST")
-    .body(
-      serde_json::to_vec(&r)
-        .map_err(|_| Error::UnexpectedType)?
-        .into_body(),
-    )
-    .map_err(|err| Error::Other(err.to_string()))?;
+    .body(serde_json::to_vec(&r)?.into_body())
+    .map_err(|err| Error::Other(err.into()))?;
 
   let client = Client::new();
   let (_parts, mut body) = client
     .send(request)
     .await
-    .map_err(|err| Error::Other(err.to_string()))?
+    .map_err(|err| Error::Other(err.into()))?
     .into_parts();
 
-  let bytes = body
-    .bytes()
-    .await
-    .map_err(|err| Error::Other(err.to_string()))?;
+  let bytes = body.bytes().await.map_err(|err| Error::Other(err.into()))?;
 
   return match serde_json::from_slice(&bytes) {
     Ok(SqliteResponse::Query { rows }) => Ok(
@@ -100,8 +124,11 @@ pub async fn query(
         })
         .collect::<Result<Vec<_>, _>>()?,
     ),
-    Ok(_) => Err(Error::UnexpectedType),
-    Err(err) => Err(Error::Other(err.to_string())),
+    Ok(SqliteResponse::Error(err)) => Err(Error::Other(err.into())),
+    Ok(resp) => Err(Error::UnexpectedType(
+      format!("Expected QueryResponse, got: {resp:?}").into(),
+    )),
+    Err(err) => Err(Error::Other(err.into())),
   };
 }
 
@@ -116,54 +143,27 @@ pub async fn execute(
   let request = Request::builder()
     .uri("http://__sqlite/execute")
     .method("POST")
-    .body(
-      serde_json::to_vec(&r)
-        .map_err(|_| Error::UnexpectedType)?
-        .into_body(),
-    )
-    .map_err(|err| Error::Other(err.to_string()))?;
+    .body(serde_json::to_vec(&r)?.into_body())
+    .map_err(|err| Error::Other(err.into()))?;
 
   let client = Client::new();
   let (_parts, mut body) = client
     .send(request)
     .await
-    .map_err(|err| Error::Other(err.to_string()))?
+    .map_err(|err| Error::Other(err.into()))?
     .into_parts();
 
-  let bytes = body
-    .bytes()
-    .await
-    .map_err(|err| Error::Other(err.to_string()))?;
+  let bytes = body.bytes().await.map_err(|err| Error::Other(err.into()))?;
 
   return match serde_json::from_slice(&bytes) {
     Ok(SqliteResponse::Execute { rows_affected }) => Ok(rows_affected),
-    Ok(_) => Err(Error::UnexpectedType),
-    Err(err) => Err(Error::Other(err.to_string())),
+    Ok(SqliteResponse::Error(err)) => Err(Error::Other(err.into())),
+    Ok(resp) => Err(Error::UnexpectedType(
+      format!("Expected ExecuteResponse, got: {resp:?}").into(),
+    )),
+    Err(err) => Err(Error::Other(err.into())),
   };
 }
-
-// fn from_json_value(value: serde_json::Value) -> Result<Value, Error> {
-//   return match value {
-//     serde_json::Value::Null => Ok(Value::Null),
-//     serde_json::Value::String(s) => Ok(Value::Text(s)),
-//     serde_json::Value::Object(mut map) => match map.remove("blob") {
-//       Some(serde_json::Value::String(str)) => Ok(Value::Blob(BASE64_URL_SAFE.decode(&str)?)),
-//       _ => Err(Error::UnexpectedType),
-//     },
-//     serde_json::Value::Number(n) => {
-//       if let Some(n) = n.as_i64() {
-//         Ok(Value::Integer(n))
-//       } else if let Some(n) = n.as_u64() {
-//         Ok(Value::Integer(n as i64))
-//       } else if let Some(n) = n.as_f64() {
-//         Ok(Value::Real(n))
-//       } else {
-//         Err(Error::NotANumber)
-//       }
-//     }
-//     _ => Err(Error::UnexpectedType),
-//   };
-// }
 
 fn from_sql_value(value: SqlValue) -> Result<Value, DecodeError> {
   return match value {
@@ -175,28 +175,6 @@ fn from_sql_value(value: SqlValue) -> Result<Value, DecodeError> {
   };
 }
 
-// #[derive(Serialize)]
-// struct Blob {
-//   blob: String,
-// }
-//
-// impl serde::ser::Serialize for Value {
-//   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//   where
-//     S: serde::ser::Serializer,
-//   {
-//     return match self {
-//       Value::Null => serializer.serialize_unit(),
-//       Value::Text(s) => serializer.serialize_str(s),
-//       Value::Integer(i) => serializer.serialize_i64(*i),
-//       Value::Real(f) => serializer.serialize_f64(*f),
-//       Value::Blob(blob) => serializer.serialize_some(&Blob {
-//         blob: BASE64_URL_SAFE.encode(blob),
-//       }),
-//     };
-//   }
-// }
-
 pub fn to_sql_value(value: Value) -> SqlValue {
   return match value {
     Value::Null => SqlValue::Null,
@@ -207,17 +185,14 @@ pub fn to_sql_value(value: Value) -> SqlValue {
   };
 }
 
-// pub fn to_json_value(value: Value) -> serde_json::Value {
-//   return match value {
-//     Value::Null => serde_json::Value::Null,
-//     Value::Text(s) => serde_json::Value::String(s),
-//     Value::Integer(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-//     Value::Real(f) => match serde_json::Number::from_f64(f) {
-//       Some(n) => serde_json::Value::Number(n),
-//       None => serde_json::Value::Null,
-//     },
-//     Value::Blob(blob) => serde_json::json!({
-//         "blob": BASE64_URL_SAFE.encode(blob)
-//     }),
-//   };
-// }
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn escape_test() {
+    assert_eq!("'foo'", escape("foo"));
+    assert_eq!("'f''oo'", escape("f'oo"));
+    assert_eq!("'foo\\0more'", escape("foo\0more"));
+  }
+}

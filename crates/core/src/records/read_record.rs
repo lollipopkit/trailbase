@@ -120,10 +120,18 @@ pub async fn read_record_handler(
     return Err(RecordError::RecordNotFound);
   };
 
-  return Ok(Json(
-    row_to_json_expand(api.columns(), &row, prefix_filter, api.expand())
-      .map_err(|err| RecordError::Internal(err.into()))?,
-  ));
+  let json_response = row_to_json_expand(api.columns(), &row, prefix_filter, api.expand())
+    .map_err(|err| RecordError::Internal(err.into()))?;
+
+  #[cfg(debug_assertions)]
+  crate::records::json_schema::validate_api_json_schema(
+    &state,
+    &api,
+    trailbase_schema::json_schema::JsonSchemaMode::Select,
+    &json_response,
+  )?;
+
+  return Ok(Json(json_response));
 }
 
 type GetUploadedFileFromRecordPath = Path<(
@@ -289,14 +297,14 @@ mod test {
       .unwrap();
 
     let count: i64 = conn
-      .read_query_row_f(
+      .read_query_row_get(
         format!(r#"SELECT COUNT(*) from "{USER_TABLE}" WHERE email = :email"#),
         trailbase_sqlite::named_params! {
           ":email": EMAIL,
           ":unused": "unused",
           ":foo": 42,
         },
-        |row| row.get(0),
+        0,
       )
       .await
       .unwrap()
@@ -417,15 +425,19 @@ mod test {
 
   async fn create_test_record_api(state: &AppState, api_name: &str) {
     let conn = state.conn();
+
+    let table_name = "table 😍";
     conn
       .execute(
         format!(
-          r#"CREATE TABLE 'table' (
+          r#"CREATE TABLE '{table_name}' (
             id           BLOB PRIMARY KEY NOT NULL CHECK(is_uuid_v7(id)) DEFAULT(uuid_v7()),
             file         TEXT CHECK(jsonschema('std.FileUpload', file)),
             files        TEXT CHECK(jsonschema('std.FileUploads', files)),
-            -- Add a "keyword" column to ensure escaping is correct
-            [index]      TEXT NOT NULL DEFAULT('')
+            -- Add a "keyword" column to ensure escaping is correct.
+            [index]      TEXT NOT NULL DEFAULT(''),
+            -- A special char column to check more escaping.
+            [test 😍]    TEXT NOT NULL DEFAULT('')
           ) STRICT"#
         ),
         (),
@@ -439,7 +451,7 @@ mod test {
       &state,
       RecordApiConfig {
         name: Some(api_name.to_string()),
-        table_name: Some("table".to_string()),
+        table_name: Some(table_name.to_string()),
         acl_world: [
           PermissionFlag::Create as i32,
           PermissionFlag::Read as i32,
@@ -454,7 +466,6 @@ mod test {
     .unwrap();
   }
 
-  // NOTE: would ideally be in a create_record test instead.
   #[tokio::test]
   async fn test_empty_create_record() {
     let state = test_state(None).await.unwrap();
@@ -501,13 +512,10 @@ mod test {
         Path(API_NAME.to_string()),
         Query(CreateRecordQuery::default()),
         None,
-        Either::Json(
-          json_row_from_value(json!({
-            "index": column_value.to_string(),
-          }))
-          .unwrap()
-          .into(),
-        ),
+        Either::Json(json!({
+          "index": column_value.to_string(),
+          "test 😍": column_value.to_string(),
+        })),
       )
       .await
       .unwrap(),
@@ -532,6 +540,11 @@ mod test {
 
     assert_eq!(
       *map.get("index").unwrap(),
+      serde_json::Value::String(column_value.to_string())
+    );
+
+    assert_eq!(
+      *map.get("test 😍").unwrap(),
       serde_json::Value::String(column_value.to_string())
     );
   }
@@ -997,9 +1010,7 @@ mod test {
 
     let index: String = state
       .conn()
-      .read_query_row_f(r#"SELECT "index" from "table" WHERE pid = 2"#, (), |row| {
-        row.get(0)
-      })
+      .read_query_row_get(r#"SELECT "index" from "table" WHERE pid = 2"#, (), 0)
       .await
       .unwrap()
       .unwrap();
@@ -1306,9 +1317,11 @@ mod test {
     .await
     .unwrap();
 
-    let coords = geos::CoordSeq::new_from_vec(&[&[12.4924, 41.8902]]).unwrap();
-    let geometry = geos::Geometry::create_point(coords).unwrap();
-    let json_geometry: geos::geojson::Geometry = geometry.try_into().unwrap();
+    let json_geometry: geos::geojson::Geometry = {
+      let coords = geos::CoordSeq::new_from_vec(&[&[12.4924, 41.8902]]).unwrap();
+      let geometry = geos::Geometry::create_point(coords).unwrap();
+      geometry.try_into().unwrap()
+    };
 
     let record = json!({
       "id": 1,

@@ -25,6 +25,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
+import { wkbToWkt, wktToWkb } from "@/lib/geometry";
 import type { Record } from "@/lib/record";
 import { updateRow, insertRow } from "@/lib/api/row";
 import {
@@ -46,10 +47,11 @@ import type {
 import { tryParseFloat, tryParseBigInt, fromHex } from "@/lib/utils";
 import {
   getDefaultValue,
-  isNotNull,
-  isPrimaryKeyColumn,
-  isNullableColumn,
   getForeignKey,
+  isGeometryColumn,
+  isNotNull,
+  isNullableColumn,
+  isPrimaryKeyColumn,
   literalDefault,
 } from "@/lib/schema";
 
@@ -58,6 +60,7 @@ function buildDefaultRecord(schema: Table): Record {
     schema.columns.map((col) => {
       const type = col.data_type;
       const isPk = isPrimaryKeyColumn(col);
+      const isGeometry = isGeometryColumn(col);
       const foreignKey = getForeignKey(col.options);
       const notNull = isNotNull(col.options);
       const defaultValue = getDefaultValue(col.options);
@@ -79,6 +82,10 @@ function buildDefaultRecord(schema: Table): Record {
       //
       // ...we fall back to generic defaults. We may be wrong based on CHECK constraints.
       if (type === "Blob") {
+        if (isGeometry) {
+          return [col.name, { Text: "POINT(0.0 0.0)" }];
+        }
+
         if (foreignKey !== undefined) {
           return [
             col.name,
@@ -107,6 +114,27 @@ function buildDefaultRecord(schema: Table): Record {
   );
 }
 
+function transform(schema: Table, record: Record): Record {
+  for (const column of schema.columns) {
+    const isGeometry = isGeometryColumn(column);
+    if (isGeometry) {
+      const value = record[column.name];
+      if (value !== undefined && value !== "Null" && "Text" in value) {
+        const geometry = wktToWkb(value.Text);
+        record[column.name] = {
+          Blob: {
+            Base64UrlSafe: urlSafeBase64Encode(
+              new Uint8Array(geometry.toWkb()),
+            ),
+          },
+        };
+      }
+    }
+  }
+
+  return record;
+}
+
 export function InsertUpdateRowForm(props: {
   close: () => void;
   markDirty: () => void;
@@ -125,13 +153,17 @@ export function InsertUpdateRowForm(props: {
       defaultValues,
       onSubmit: async ({ value }: { value: Record }) => {
         console.debug(`Submitting ${isUpdate() ? "update" : "insert"}:`, value);
+
+        // Transform (currently only geometry WKT->WKB)
+        const transformed = transform(props.schema, { ...value });
+
         try {
           if (isUpdate()) {
             // NOTE: updateRow mutates the value - it deletes the pk, thus shallow copy.
             // NOTE: value['key'] === undefined won't be serialized to JSON and thus sent.
-            await updateRow(props.schema, { ...value });
+            await updateRow(props.schema, transformed);
           } else {
-            await insertRow(props.schema, { ...value });
+            await insertRow(props.schema, transformed);
           }
 
           props.rowsRefetch();
@@ -390,11 +422,26 @@ function buildSqlRealFormField(opts: SqlFormFieldOptions) {
 // TODO: Right now we don't have a good way of distinguishing between
 // empty string and a non-empty default value. We'd need some other UI
 // element. An empty-input field is ambiguous.
-function buildSqlTextFormField(opts: SqlFormFieldOptions) {
+function buildSqlTextFormField(
+  opts: SqlFormFieldOptions & {
+    isGeometry: boolean;
+  },
+) {
   return function builder(field: () => FieldApiT<SqlValue | undefined>) {
     const { initialValue, initiallyDisabled } = initialState(field(), opts);
 
     const [disabled, setDisabled] = createSignal<boolean>(initiallyDisabled);
+
+    const getValue = () => {
+      const sqlValue = field().state.value;
+      if (opts.isGeometry) {
+        const blob = getBlob(sqlValue);
+        if (blob !== undefined) {
+          return wkbToWkt(urlSafeBase64Decode(blob));
+        }
+      }
+      return getText(sqlValue);
+    };
 
     return (
       <TextField class="w-full">
@@ -404,7 +451,7 @@ function buildSqlTextFormField(opts: SqlFormFieldOptions) {
           <TextFieldInput
             disabled={disabled()}
             type={"text"}
-            value={getText(field().state.value) ?? ""}
+            value={getValue() ?? ""}
             placeholder={opts.placeholder(initialValue, disabled())}
             onBlur={field().handleBlur}
             onInput={(e: Event) => {
@@ -677,6 +724,7 @@ function buildSqlValueFormField(opts: {
   const type: ColumnDataType = opts.column.data_type;
 
   const isPk = isPrimaryKeyColumn(opts.column);
+  const isGeometry = isGeometryColumn(opts.column);
   const notNull = isNotNull(opts.column.options);
   const nullable = isNullableColumn({
     type,
@@ -693,10 +741,31 @@ function buildSqlValueFormField(opts: {
     initial: SqlValue | undefined,
     disabled: boolean,
   ): string {
-    if (disabled) return "NULL";
-    return opts.isUpdate
-      ? initialValuePlaceholder(initial)
-      : defaultValuePlaceholder(type, defaultValue);
+    if (disabled) {
+      return "NULL";
+    }
+
+    if (opts.isUpdate) {
+      if (
+        isGeometry &&
+        initial !== undefined &&
+        initial !== "Null" &&
+        "Blob" in initial
+      ) {
+        const blob = initial.Blob;
+        if ("Base64UrlSafe" in blob) {
+          try {
+            return wkbToWkt(urlSafeBase64Decode(blob.Base64UrlSafe));
+          } catch {
+            // Fall-through
+          }
+        }
+      }
+
+      return initialValuePlaceholder(initial);
+    }
+
+    return defaultValuePlaceholder(type, defaultValue);
   }
 
   switch (type) {
@@ -722,9 +791,24 @@ function buildSqlValueFormField(opts: {
         nullable,
         hasDefault: defaultValue !== undefined,
         placeholder,
+        isGeometry: isGeometry,
         disabled: opts.isUpdate && isPk,
       });
-    case "Blob":
+    case "Blob": {
+      if (isGeometry) {
+        // We get a geometry blob value but want to display text, e.g. on-edit
+        // we don't want to encode to base64. We then convert the text back to
+        // blob only on submit :/.
+        return buildSqlTextFormField({
+          label: <Label name={name} type={type} notNull={notNull} />,
+          nullable,
+          hasDefault: defaultValue !== undefined,
+          placeholder,
+          isGeometry: isGeometry,
+          disabled: opts.isUpdate && isPk,
+        });
+      }
+
       return buildSqlBlobFormField({
         label: <Label name={name} type={type} notNull={notNull} />,
         nullable,
@@ -732,6 +816,7 @@ function buildSqlValueFormField(opts: {
         placeholder,
         disabled: opts.isUpdate && isPk,
       });
+    }
     case "Any":
       return buildSqlAnyFormField({
         label: <Label name={name} type={type} notNull={notNull} />,
@@ -774,12 +859,11 @@ function validateUpdateSqlValueFormField({
   value: SqlValue | undefined;
 }): string | undefined {
   const type: ColumnDataType = column.data_type;
-  const isPk: boolean = isPrimaryKeyColumn(column);
-  const notNull: boolean = isNotNull(column.options);
+  const isGeometry: boolean = isGeometryColumn(column);
   const nullable: boolean = isNullableColumn({
     type,
-    notNull: notNull,
-    isPk: isPk,
+    notNull: isNotNull(column.options),
+    isPk: isPrimaryKeyColumn(column),
   });
 
   // During update, undefined simply means: don't send and preserve currently
@@ -795,7 +879,9 @@ function validateUpdateSqlValueFormField({
     );
   }
 
-  assertColumnType(type, value);
+  if (!isGeometry) {
+    assertColumnType(type, value);
+  }
 
   // Input validated by input element itself.
   // if ("Integer" in value) { }
@@ -817,7 +903,13 @@ function validateUpdateSqlValueFormField({
   }
 
   if ("Text" in value) {
-    /// TODO: Validation could be more comprehensive, e.g. JSON inputs.
+    if (isGeometry) {
+      try {
+        wktToWkb(value.Text);
+      } catch {
+        return "Not a valid WKT geometry";
+      }
+    }
   }
 
   // Pass validation.
@@ -833,6 +925,7 @@ function validateInsertSqlValueFormField({
 }): string | undefined {
   const type: ColumnDataType = column.data_type;
   const isPk: boolean = isPrimaryKeyColumn(column);
+  const isGeometry: boolean = isGeometryColumn(column);
   const notNull: boolean = isNotNull(column.options);
   const nullable: boolean = isNullableColumn({
     type,
@@ -859,7 +952,9 @@ function validateInsertSqlValueFormField({
     );
   }
 
-  assertColumnType(type, value);
+  if (!isGeometry) {
+    assertColumnType(type, value);
+  }
 
   // Input validated by input element itself.
   // if ("Integer" in value) { }
@@ -881,7 +976,13 @@ function validateInsertSqlValueFormField({
   }
 
   if ("Text" in value) {
-    /// TODO: Validation could be more comprehensive, e.g. JSON inputs.
+    if (isGeometry) {
+      try {
+        wktToWkb(value.Text);
+      } catch {
+        return "Not a valid WKT geometry";
+      }
+    }
   }
 
   // Pass validation.

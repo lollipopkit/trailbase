@@ -48,7 +48,7 @@ pub async fn get_avatar_handler(
     &trailbase_schema::QualifiedNameEscaped::new(&AVATAR_TABLE_NAME),
     file_column_meta,
     "user",
-    rusqlite::types::Value::Blob(user_id.into()),
+    trailbase_sqlite::Value::Blob(user_id.into()),
   )
   .await
   .map_err(|err| match err {
@@ -135,7 +135,7 @@ pub async fn delete_avatar_handler(
 
   let main_conn = state.connection_manager().main_entry().connection;
   main_conn
-    .execute(QUERY, [rusqlite::types::Value::Blob(user.uuid.into())])
+    .execute(QUERY, [trailbase_sqlite::Value::Blob(user.uuid.into())])
     .await?;
 
   return Ok(());
@@ -218,7 +218,7 @@ mod tests {
 
     let user_x_token = login_with_password(&state, email, password).await.unwrap();
 
-    const QUERY: &str = formatcp!("SELECT * FROM '{USER_TABLE}' WHERE email = $1");
+    const QUERY: &str = formatcp!(r#"SELECT * FROM "{USER_TABLE}" WHERE email = $1"#);
 
     let db_user = state
       .user_conn()

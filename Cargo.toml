@@ -22,6 +22,8 @@ default-members = [
 ]
 exclude = [
   "crates/extension-so",
+  # Fork of pgrow2serde depends on external PG setup.
+  "vendor/pgrow2serde",
 ]
 
 # https://doc.rust-lang.org/cargo/reference/profiles.html
@@ -51,10 +53,12 @@ strip = "debuginfo" # ("symbols", "debuginfo", "none")
 opt-level = 1
 
 [workspace.dependencies]
-askama = { version = "0.15.1", default-features = false, features = ["derive", "std", "config"] }
+askama = { version = "0.16.0", default-features = false, features = ["derive", "std", "config"] }
 axum = { version = "^0.8.1", features = ["multipart"] }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc", "std"] }
 env_logger = { version = "^0.11.8", default-features = false, features = ["auto-color", "humantime"] }
+flume = { version = "0.12.0", default-feature = false, features = ["select"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["alloc", "spin"] }
 libsqlite3-sys = { version = "0.37.0", default-features = false, features = ["bundled", "preupdate_hook"] }
 litegis = { version = "0.0.6", default-features = false }
 minijinja = { version = "2.1.2", default-features = false }
@@ -63,32 +67,35 @@ rand = "^0.10.0"
 reqwest = { version = "0.13.1", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "cache", "column_decltype", "functions", "backup", "preupdate_hook"] }
 rust-embed = { version = "8.4.0", default-features = false, features = ["mime-guess"] }
-serde = { version = "^1.0.203", features = ["derive"] }
+serde = { version = "^1.0.203", features = ["derive", "rc"] }
 serde_json = { version = "^1.0.117" }
 serde_qs = { version = "1.0.0", default-features = false, features = [] }
 serde_rusqlite = { path = "vendor/serde_rusqlite" }
 sqlite-vec = { path = "vendor/sqlite-vec/bindings/rust", default-features = false }
+sqlite3-parser = "0.16.0"
 tokio = { version = "^1.38.0", default-features = false, features = ["fs", "io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.1", default-features = false }
 tracing = { version = "0.1.40", default-features = false }
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["smallvec", "std", "fmt", "json"] }
 trailbase = { path = "crates/core", version = "0.2.0", default-features = false, features=["wasm"] }
 trailbase-assets = { path = "crates/assets", version = "0.2.0" }
 trailbase-build = { path = "crates/build", version = "0.1.1" }
-trailbase-client = { path = "crates/client", version = "0.6.0" }
+trailbase-client = { path = "crates/client", version = "0.8.0" }
 trailbase-extension = { path = "crates/extension", version = "0.3.0" }
+trailbase-pgrow2serde = { path = "vendor/pgrow2serde" }
 trailbase-qs = { path = "crates/qs", version = "0.1.0" }
+trailbase-reactive = { path = "crates/reactive", version = "0.1.0" }
 trailbase-refinery = { path = "crates/refinery", version = "0.1.0" }
 trailbase-schema = { path = "crates/schema", version = "0.1.0" }
-trailbase-sqlean = { path = "crates/sqlean", version = "0.0.3" }
-trailbase-sqlite = { path = "crates/sqlite", version = "0.3.0" }
+trailbase-sqlite = { path = "crates/sqlite", version = "0.3.0", default-features = false }
 trailbase-sqlvalue = { path = "crates/sqlvalue", version = "0.1.0" }
 trailbase-wasi-keyvalue = { path = "crates/wasi-keyvalue", version = "0.1.0" }
-trailbase-wasm = { path = "crates/wasm-runtime-guest", version = "0.5.0" }
+trailbase-wasm = { path = "crates/wasm-runtime-guest", version = "0.5.1" }
 trailbase-wasm-common = { path = "crates/wasm-runtime-common", version = "0.2.0" }
 trailbase-wasm-runtime-host = { path = "crates/wasm-runtime-host", version = "0.1.0" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl", "indexmap-impl"] }
 uuid = { version = "1", default-features = false, features = ["std", "v4", "v7", "serde"] }
-wasmtime = { version = "42.0.0", features = ["winch"] }
-wasmtime-wasi = { version = "42.0.0", default-features = false, features = [] }
-wasmtime-wasi-http = { version = "42.0.0", features = [] }
-wasmtime-wasi-io = { version = "42.0.0", features = [] }
+wasmtime = { version = "44.0.0", features = ["winch"] }
+wasmtime-wasi = { version = "44.0.0", default-features = false, features = [] }
+wasmtime-wasi-http = { version = "44.0.0", features = [] }
+wasmtime-wasi-io = { version = "44.0.0", features = [] }

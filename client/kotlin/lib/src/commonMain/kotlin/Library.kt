@@ -33,29 +33,49 @@ data class JwtTokenClaims(
 )
 
 @Serializable
-sealed class DbEvent {
-  public class Update(val obj: JsonObject) : DbEvent()
-  public class Insert(val obj: JsonObject) : DbEvent()
-  public class Delete(val obj: JsonObject) : DbEvent()
-  public class Error(val msg: String) : DbEvent()
+sealed class ChangeEvent {
+  public class Update(val seq: Long?, val obj: JsonObject) : ChangeEvent()
+  public class Insert(val seq: Long?, val obj: JsonObject) : ChangeEvent()
+  public class Delete(val seq: Long?, val obj: JsonObject) : ChangeEvent()
+
+  public enum class ErrorStatus(val id: Long) {
+    UNKNOWN(0),
+    FORBIDDEN(1),
+    LOSS(2);
+
+    companion object {
+      private val byId: Map<Long, ErrorStatus> = entries.associateBy { it.id }
+
+      fun fromId(id: Long?): ErrorStatus = byId[id ?: 0] ?: UNKNOWN
+    }
+  }
+  public class Error(val seq: Long?, val status: ErrorStatus, val message: String?) : ChangeEvent()
 
   companion object {
-    fun from(obj: JsonObject): DbEvent? {
+    fun parse(msg: String): ChangeEvent? {
+      val obj: JsonObject = jsonSerializer.decodeFromString(msg)
+      val seq: Long? = obj.get("seq")?.jsonPrimitive?.longOrNull
+
       val update = obj.get("Update")
       if (update != null) {
-        return DbEvent.Update(update.jsonObject)
+        return ChangeEvent.Update(seq, update.jsonObject)
       }
       val insert = obj.get("Insert")
       if (insert != null) {
-        return DbEvent.Insert(insert.jsonObject)
+        return ChangeEvent.Insert(seq, insert.jsonObject)
       }
       val delete = obj.get("Delete")
       if (delete != null) {
-        return DbEvent.Delete(delete.jsonObject)
+        return ChangeEvent.Delete(seq, delete.jsonObject)
       }
       val error = obj.get("Error")
       if (error != null) {
-        return DbEvent.Error("${error}")
+        val errObj = error.jsonObject
+        return ChangeEvent.Error(
+                seq,
+                ErrorStatus.fromId(errObj.get("status")?.jsonPrimitive?.longOrNull),
+                errObj.get("message")?.jsonPrimitive?.contentOrNull,
+        )
       }
 
       return null
@@ -235,20 +255,13 @@ class RecordApi(val name: String, val client: Client) {
     client.fetch("${RECORD_API}/${name}/${id.id()}", Method.delete)
   }
 
-  suspend inline fun <reified T> subscribe(id: RecordId): Flow<DbEvent> {
+  suspend inline fun <reified T> subscribe(id: RecordId): Flow<ChangeEvent> {
+    val path = "${RECORD_API}/${name}/subscribe/${id.id()}"
 
-    val url = "${client.site()}/${RECORD_API}/${name}/subscribe/${id.id()}"
+    // NOTE: We should probably push this into a Client.sse.
     val tokenState = TokenState.build(client.tokens())
 
-    val session =
-            client.http.sseSession(
-                    urlString = url,
-                    block = {
-                      method = HttpMethod.Get
-                      headers { tokenState.headers.forEach { appendAll(it.key, it.value) } }
-                      contentType(ContentType.Application.Json)
-                    }
-            )
+    val session = client.transport.sse(path, Method.get, tokenState.headers)
 
     // Check HTTP status before processing SSE events
     if (!session.call.response.status.isSuccess()) {
@@ -260,8 +273,7 @@ class RecordApi(val name: String, val client: Client) {
         // event.data?.takeIf { predicate }(predicate)
         val data = ev.data
         if (data != null) {
-          val obj: JsonObject = jsonSerializer.decodeFromString(data)
-          val event = DbEvent.from(obj)
+          val event = ChangeEvent.parse(data)
           if (event != null) {
             emit(event)
           }
@@ -284,10 +296,101 @@ class HttpException(val status: Int, message: String?) : Throwable(message) {
   }
 }
 
+abstract class Transport {
+  abstract suspend fun fetch(
+          path: String,
+          method: Method = Method.get,
+          headers: Map<String, List<String>>? = null,
+          params: Map<String, String>? = null,
+          body: Any? = null,
+  ): HttpResponse
+
+  abstract suspend fun sse(
+          path: String,
+          method: Method = Method.get,
+          headers: Map<String, List<String>>? = null,
+          params: Map<String, String>? = null,
+  ): ClientSSESession
+}
+
+class DefaultTransport(private val base: Url, public val http: HttpClient = initClient()) :
+        Transport() {
+
+  override suspend fun fetch(
+          path: String,
+          method: Method,
+          headers: Map<String, List<String>>?,
+          params: Map<String, String>?,
+          body: Any?,
+  ): HttpResponse {
+    if (path.startsWith("/")) {
+      throw Exception("path start with '/': ${path}")
+    }
+
+    val response =
+            http.request(base) {
+              this.method =
+                      when (method) {
+                        Method.get -> HttpMethod.Get
+                        Method.post -> HttpMethod.Post
+                        Method.patch -> HttpMethod.Patch
+                        Method.delete -> HttpMethod.Delete
+                      }
+              url {
+                path(path)
+                if (params != null) {
+                  for ((k, v) in params) {
+                    parameters.append(k, v)
+                  }
+                }
+              }
+              headers { headers?.forEach { appendAll(it.key, it.value) } }
+              contentType(ContentType.Application.Json)
+              setBody(body)
+            }
+
+    return response
+  }
+
+  override suspend fun sse(
+          path: String,
+          method: Method,
+          headers: Map<String, List<String>>?,
+          params: Map<String, String>?,
+  ): ClientSSESession {
+    if (path.startsWith("/")) {
+      throw Exception("path start with '/': ${path}")
+    }
+
+    return http.sseSession(
+            urlString = base.toString(),
+            block = {
+              this.method =
+                      when (method) {
+                        Method.get -> HttpMethod.Get
+                        Method.post -> HttpMethod.Post
+                        Method.patch -> HttpMethod.Patch
+                        Method.delete -> HttpMethod.Delete
+                      }
+              url {
+                path(path)
+                if (params != null) {
+                  for ((k, v) in params) {
+                    parameters.append(k, v)
+                  }
+                }
+              }
+              headers { headers?.forEach { appendAll(it.key, it.value) } }
+              contentType(ContentType.Application.Json)
+            }
+    )
+  }
+}
+
 class Client(
         private val site: Url,
         private var tokenState: TokenState,
-        public val http: HttpClient = initClient()
+        public val transport: Transport = DefaultTransport(site),
 ) {
   constructor(
           site: String
@@ -332,16 +435,20 @@ class Client(
                     throwOnError = false
             )
 
-    if (response.status == HttpStatusCode.Forbidden) {
-      val token: MultiFactorAuthToken = response.body()
-      return token
-    } else if (!response.status.isSuccess()) {
-      throw HttpException(response.status.value, response.body())
+    when (response.status) {
+      HttpStatusCode.Forbidden -> {
+        val token: MultiFactorAuthToken = response.body()
+        return token
+      }
+      HttpStatusCode.OK -> {
+        val tokens: Tokens = response.body()
+        tokenState = TokenState.build(tokens)
+        return null
+      }
+      else -> {
+        throw HttpException(response.status.value, response.body())
+      }
     }
-
-    val tokens: Tokens = response.body()
-    tokenState = TokenState.build(tokens)
-    return null
   }
 
   suspend fun loginSecond(token: MultiFactorAuthToken, code: String) {
@@ -400,7 +507,7 @@ class Client(
   suspend fun refreshAuthToken() {
     val refreshToken = tokenState.shouldRefresh()
     if (refreshToken != null) {
-      tokenState = refreshTokensImpl(refreshToken)
+      tokenState = refreshTokensImpl(transport, refreshToken)
     }
   }
 
@@ -413,52 +520,41 @@ class Client(
   ): HttpResponse {
     val refreshToken = tokenState.shouldRefresh()
     if (refreshToken != null) {
-      tokenState = refreshTokensImpl(refreshToken)
+      tokenState = refreshTokensImpl(transport, refreshToken)
     }
 
-    val response =
-            http.request(site) {
-              this.method =
-                      when (method) {
-                        Method.get -> HttpMethod.Get
-                        Method.post -> HttpMethod.Post
-                        Method.patch -> HttpMethod.Patch
-                        Method.delete -> HttpMethod.Delete
-                      }
-              url {
-                path(path)
-                if (params != null) {
-                  for ((k, v) in params) {
-                    parameters.append(k, v)
-                  }
-                }
-              }
-              headers { tokenState.headers.forEach { appendAll(it.key, it.value) } }
-              contentType(ContentType.Application.Json)
-              setBody(body)
-            }
-
+    val response = transport.fetch(path, method, tokenState.headers, params, body)
     if (!response.status.isSuccess() && throwOnError) {
       throw HttpException(response.status.value, response.body())
     }
 
     return response
   }
+}
 
-  private suspend fun refreshTokensImpl(refreshToken: String): TokenState {
-    @Serializable data class Body(val refresh_token: String)
+private suspend fun refreshTokensImpl(transport: Transport, refreshToken: String): TokenState {
+  @Serializable data class Body(val refresh_token: String)
 
-    val tokens: Tokens =
-            http
-                    .post(site) {
-                      url { path("${AUTH_API}/refresh") }
-                      contentType(ContentType.Application.Json)
-                      headers { tokenState.headers.forEach { appendAll(it.key, it.value) } }
-                      setBody(Body(refreshToken))
-                    }
-                    .body()
+  val response =
+          transport.fetch(
+                  "${AUTH_API}/refresh",
+                  Method.post,
+                  /*headers=*/ null,
+                  /*params=*/ null,
+                  Body(refreshToken),
+          )
 
-    return TokenState.build(tokens)
+  return when (response.status) {
+    HttpStatusCode.Unauthorized -> {
+      // Refresh token was rejected w/o means to recover. May as well log out.
+      TokenState.build(null)
+    }
+    HttpStatusCode.OK -> {
+      TokenState.build(response.body())
+    }
+    else -> {
+      throw HttpException(response.status.value, response.body())
+    }
   }
 }
 

@@ -1,12 +1,12 @@
 use log::*;
 use object_store::ObjectStore;
-use reactivate::Reactive;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use trailbase_extension::jsonschema::JsonSchemaRegistry;
+use trailbase_reactive::{AsyncReactive, DeriveInput, Reactive};
 use trailbase_schema::QualifiedName;
 
 use crate::auth::jwt::JwtHelper;
@@ -15,11 +15,11 @@ use crate::config::proto::{
   Config, JsonSchemaConfig, RecordApiConfig, S3StorageConfig, hash_config,
 };
 use crate::config::{ConfigError, validate_config, write_config_and_vault_textproto};
-use crate::connection::{ConnectionEntry, ConnectionError, ConnectionManager};
+use crate::connection::{BuildOptions, ConnectionEntry, ConnectionError, ConnectionManager};
 use crate::data_dir::DataDir;
 use crate::email::Mailer;
 use crate::records::RecordApi;
-use crate::records::subscribe::SubscriptionManager;
+use crate::records::subscribe::manager::SubscriptionManager;
 use crate::scheduler::{JobRegistry, build_job_registry_from_config};
 use crate::wasm::Runtime;
 
@@ -50,7 +50,7 @@ struct InternalState {
 
   jwt: JwtHelper,
 
-  record_apis: Reactive<HashMap<String, RecordApi>>,
+  record_apis: AsyncReactive<HashMap<String, RecordApi>>,
   subscription_manager: SubscriptionManager,
   object_store: Arc<dyn ObjectStore>,
 
@@ -58,6 +58,10 @@ struct InternalState {
   wasm_runtimes: Vec<Arc<RwLock<Runtime>>>,
   /// WASM runtime builders needed to rebuild above runtimes, e.g. when hot-reloading.
   wasm_runtimes_builder: crate::wasm::WasmRuntimeBuilder,
+
+  #[cfg(test)]
+  #[allow(unused)]
+  pg_uri: Option<String>,
 
   #[cfg(test)]
   #[allow(unused)]
@@ -87,7 +91,7 @@ pub struct AppState {
 }
 
 impl AppState {
-  pub(crate) fn new(args: AppStateArgs) -> Self {
+  pub(crate) async fn new(args: AppStateArgs) -> Self {
     let config = Reactive::new(args.config);
 
     let public_url = args.public_url.clone();
@@ -111,7 +115,8 @@ impl AppState {
     let record_apis = build_record_apis(
       args.connection_manager.clone(),
       config.derive(|c| c.record_apis.clone()),
-    );
+    )
+    .await;
 
     let main_conn = args.connection_manager.main_entry().connection;
     let object_store: Arc<dyn ObjectStore> = args.object_store.into();
@@ -161,10 +166,8 @@ impl AppState {
         site_url,
         dev: args.dev,
         demo: args.demo,
-        auth: derive_unchecked(&config, |c| {
-          Arc::new(AuthOptions::from_config(c.auth.clone()))
-        }),
-        jobs: derive_unchecked(&config, move |c| {
+        auth: config.derive_unchecked(|c| Arc::new(AuthOptions::from_config(c.auth.clone()))),
+        jobs: config.derive_unchecked(move |c| {
           debug!("(re-)building jobs from config");
 
           let (data_dir, conn_mgr, logs_conn, session_conn, object_store) = &jobs_input;
@@ -184,7 +187,7 @@ impl AppState {
             }),
           );
         }),
-        mailer: derive_unchecked(&config, Mailer::new_from_config),
+        mailer: config.derive_unchecked(Mailer::new_from_config),
         config,
         json_schema_registry: args.json_schema_registry,
         conn: (*main_conn).clone(),
@@ -201,6 +204,8 @@ impl AppState {
           .map(|rt| Arc::new(RwLock::new(rt)))
           .collect(),
         wasm_runtimes_builder,
+        #[cfg(test)]
+        pg_uri: None,
         #[cfg(test)]
         test_cleanup: vec![],
       }),
@@ -270,14 +275,14 @@ impl AppState {
   pub async fn rebuild_connection_metadata(
     &self,
   ) -> Result<(), crate::connection::ConnectionError> {
-    self.state.connection_manager.rebuild_metadata()?;
+    self.state.connection_manager.rebuild_metadata().await?;
 
     // Rebuild connection metadata in RecordApis.
-    self.state.record_apis.with_value(|apis| {
-      for (_name, api) in apis.iter() {
-        api.rebuild_connection_metadata(&self.state.json_schema_registry);
-      }
-    });
+    for api in self.state.record_apis.ptr().await.values() {
+      api
+        .rebuild_connection_metadata(&self.state.json_schema_registry)
+        .await?;
+    }
 
     // We typically rebuild the schema representations when the DB schemas change, which in turn
     // can invalidate the config, e.g. an API may reference a deleted table. Let's make sure to
@@ -285,10 +290,12 @@ impl AppState {
     // happened rendering the current config invalid. Unlike a config update, it's too late to
     // reject anything.
     let config = self.get_config();
-    validate_config(&self.state.connection_manager, &config).map_err(|err| {
-      log::error!("Schema change invalidated config: {err}");
-      return crate::schema_metadata::SchemaLookupError::Other(err.into());
-    })?;
+    validate_config(&self.state.connection_manager, &config)
+      .await
+      .map_err(|err| {
+        log::error!("Schema change invalidated config: {err}");
+        return err;
+      })?;
 
     return Ok(());
   }
@@ -318,27 +325,18 @@ impl AppState {
   }
 
   pub fn lookup_record_api(&self, name: &str) -> Option<RecordApi> {
-    let mut r: Option<RecordApi> = None;
-    self.state.record_apis.with_value(|apis| {
-      r = apis.get(name).cloned();
-    });
-    return r;
+    return self.state.record_apis.snapshot().get(name).cloned();
   }
 
-  pub fn get_config(&self) -> Config {
-    return self.state.config.value();
+  pub fn get_config(&self) -> Arc<Config> {
+    return self.state.config.ptr();
   }
 
   pub fn access_config<F, T>(&self, f: F) -> T
   where
     F: FnOnce(&Config) -> T,
   {
-    let mut result: Option<T> = None;
-    let r = &mut result;
-    self.state.config.with_value(move |c| {
-      let _ = r.insert(f(c));
-    });
-    return result.expect("inserted");
+    return f(&self.state.config.ptr());
   }
 
   pub async fn validate_and_update_config(
@@ -347,7 +345,7 @@ impl AppState {
     hash: Option<String>,
   ) -> Result<(), ConfigError> {
     let connection_manager = self.connection_manager();
-    validate_config(&connection_manager, &config)?;
+    validate_config(&connection_manager, &config).await?;
 
     match hash {
       Some(hash) => {
@@ -386,7 +384,11 @@ impl AppState {
     }
 
     // Write new config to the file system.
-    return write_config_and_vault_textproto(self.data_dir(), &connection_manager, &new_config);
+    write_config_and_vault_textproto(self.data_dir(), &connection_manager, &new_config).await?;
+
+    let _wait_for_snapshot_update = self.state.record_apis.ptr().await;
+
+    return Ok(());
   }
 
   pub(crate) fn wasm_runtimes(&self) -> &[Arc<RwLock<Runtime>>] {
@@ -521,6 +523,40 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   tokio::fs::create_dir_all(temp_dir.child("uploads")).await?;
   let data_dir = DataDir(temp_dir.path().to_path_buf());
 
+  let use_pglite = true;
+  let (pg_uri, db) = if use_pglite {
+    // Start PgLite.
+    let tcp = false;
+    if tcp {
+      let db = pglite_oxide::PgliteServer::builder()
+        .fresh_temporary()
+        // .temporary()
+        .start()?;
+
+      (Some(db.connection_uri()), Some(db))
+    } else {
+      // NOTE: `db.connection_uri()` returns rubish for UDS.
+      let sock = temp_dir.path().join(".s.PGSQL.5432");
+
+      let db = pglite_oxide::PgliteServer::builder()
+        .fresh_temporary()
+        // .temporary()
+        .unix(&sock)
+        .start()?;
+
+      let pg_uri = format!(
+        "postgresql://postgres@/template1?host={}",
+        temp_dir.path().to_string_lossy()
+      );
+
+      (Some(pg_uri), Some(db))
+    }
+  } else {
+    (None, None)
+  };
+
+  println!("PG URI: {pg_uri:?}");
+
   let TestStateOptions {
     config,
     mailer,
@@ -538,8 +574,13 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   let logs_conn = crate::connection::init_logs_db(None)?;
   let session_conn = crate::connection::init_session_db(None)?;
 
-  let connection_manager =
-    ConnectionManager::new_for_test(data_dir.clone(), json_schema_registry.clone(), vec![]);
+  let connection_manager = ConnectionManager::new_for_test(
+    data_dir.clone(),
+    json_schema_registry.clone(),
+    vec![],
+    pg_uri.clone(),
+  )
+  .await;
 
   let object_store = if std::env::var("TEST_S3_OBJECT_STORE").map_or(false, |v| v == "TRUE") {
     info!("Use S3 Storage for tests");
@@ -565,7 +606,8 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   let record_apis = build_record_apis(
     connection_manager.clone(),
     config.derive(|c| c.record_apis.clone()),
-  );
+  )
+  .await;
 
   return Ok(AppState {
     state: Arc::new(InternalState {
@@ -576,12 +618,10 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
       site_url: config.derive(|c| Arc::new(build_site_url(c).unwrap())),
       dev: true,
       demo: false,
-      auth: derive_unchecked(&config, |c| {
-        Arc::new(AuthOptions::from_config(c.auth.clone()))
-      }),
-      jobs: derive_unchecked(&config, |_c| Arc::new(JobRegistry::new())),
+      auth: config.derive_unchecked(|c| Arc::new(AuthOptions::from_config(c.auth.clone()))),
+      jobs: config.derive_unchecked(|_c| Arc::new(JobRegistry::new())),
       mailer: mailer.map_or_else(
-        || derive_unchecked(&config, Mailer::new_from_config),
+        || config.derive_unchecked(Mailer::new_from_config),
         |m| Reactive::new(m),
       ),
       config,
@@ -596,118 +636,92 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
       object_store,
       wasm_runtimes: vec![],
       wasm_runtimes_builder: Box::new(|| Ok(vec![])),
-      test_cleanup: vec![Box::new(temp_dir)],
+      pg_uri,
+      test_cleanup: vec![Box::new(db), Box::new(temp_dir)],
     }),
   });
 }
 
-// Unlike Reactive::derive, doesn't require PartialEq.
-pub(crate) fn derive_unchecked<T, U: Clone + Send + 'static>(
-  reactive: &Reactive<T>,
-  f: impl Fn(&T) -> U + Send + 'static,
-) -> Reactive<U>
-where
-  T: Clone,
-{
-  let derived: Reactive<U> = Reactive::new(f(&reactive.value()));
-
-  reactive.add_observer({
-    let derived = derived.clone();
-    move |value| derived.update_unchecked(|_| f(value))
-  });
-
-  return derived;
-}
-
-fn build_record_apis(
+async fn build_record_apis(
   connection_manager: ConnectionManager,
   record_api_configs: Reactive<Vec<RecordApiConfig>>,
-) -> Reactive<HashMap<String, RecordApi>> {
-  let record_apis: Reactive<HashMap<String, RecordApi>> = Reactive::new(
-    record_api_configs
-      .value()
-      .into_iter()
-      .map(|config| {
+) -> AsyncReactive<HashMap<String, RecordApi>> {
+  let derived = record_api_configs.derive_unchecked_async(move |DeriveInput { prev, dep }| {
+    let connection_manager = connection_manager.clone();
+    let configs: Arc<Vec<RecordApiConfig>> = dep.clone();
+    let prev = prev.cloned();
+
+    // Re-use existing connection when possible to keep subscriptions alive.
+    //
+    // WARN: We need to be very careful to how we rebuild RecordAPIs, since long-lived
+    // subscriptions may be tied to specific connections. So we need to keep connection alive
+    // whenever possible, e.g. an ACL changing for one API isn't a good reason to drop
+    // subscriptions on all APIs.
+    let get_conn =
+      async move |api_name: &str, attached_databases: &[String]| -> Result<_, ConnectionError> {
+        if let Some((_, candidate)) =
+          prev
+            .as_ref()
+            .and_then(|prev: &Arc<HashMap<String, RecordApi>>| {
+              return prev.iter().find(|(_name, api)| api.api_name() == api_name);
+            })
+          && candidate.attached_databases() == attached_databases
+        {
+          return Ok((
+            candidate.conn().clone(),
+            candidate.connection_metadata().clone(),
+          ));
+        };
+
         let ConnectionEntry {
           connection: conn,
           metadata,
-        } = if config.attached_databases.is_empty() {
+        } = if attached_databases.is_empty() {
           connection_manager.main_entry()
         } else {
           connection_manager
-            .get_entry(
-              true,
-              Some(config.attached_databases.iter().cloned().collect()),
-            )
-            .map_err(|err| err.to_string())
-            .expect("startup")
+            .get_entry(BuildOptions {
+              is_main: true,
+              attached_databases: Some(attached_databases.iter().cloned().collect()),
+              ..Default::default()
+            })
+            .await?
         };
 
-        let api = build_record_api(conn, metadata, config).expect("startup");
-        return (api.api_name().to_string(), api);
-      })
-      .collect(),
-  );
+        return Ok((conn, metadata));
+      };
 
-  // Rebuild RecordApi instances when config changes.
-  //
-  // WARN: We need to be very careful to how we rebuild RecordAPIs, since long-lived
-  // subscriptions may be tied to specific connections. So we need to keep connection alive
-  // whenever possible, e.g. an ACL changing for one API isn't a good reason to drop
-  // subscriptions on all APIs.
-  {
-    let record_apis = record_apis.clone();
-    record_api_configs.add_observer(move |record_api_configs| {
-      record_apis.update_unchecked(|old| {
-        // Re-use existing connection when possible to keep subscriptions alive.
-        let get_conn =
-          |api_name: &str, attached_databases: &[String]| -> Result<_, ConnectionError> {
-            if let Some((_, candidate)) = old.iter().find(|(_name, api)| api.api_name() == api_name)
-              && candidate.attached_databases() == attached_databases
-            {
-              return Ok((
-                candidate.conn().clone(),
-                candidate.connection_metadata().clone(),
-              ));
-            };
+    return Box::pin(async move {
+      let mut next: HashMap<String, RecordApi> = HashMap::new();
 
-            let ConnectionEntry {
-              connection: conn,
-              metadata,
-            } = if attached_databases.is_empty() {
-              connection_manager.main_entry()
-            } else {
-              connection_manager
-                .get_entry(true, Some(attached_databases.iter().cloned().collect()))?
-            };
+      for config in configs.iter() {
+        let (conn, metadata) = match get_conn(config.name(), &config.attached_databases).await {
+          Ok(x) => x,
+          Err(err) => {
+            log::error!("Failed to get conn for record API {}: {err}", config.name());
+            continue;
+          }
+        };
 
-            return Ok((conn, metadata));
-          };
+        match build_record_api(conn, metadata, config.clone()) {
+          Ok(api) => {
+            next.insert(api.api_name().to_string(), api);
+          }
+          Err(err) => {
+            log::error!("Failed to build record API {}: {err}", config.name());
+          }
+        };
+      }
 
-        return record_api_configs
-          .iter()
-          .filter_map(|config| {
-            let (conn, metadata) = get_conn(config.name(), &config.attached_databases)
-              .map_err(|err| {
-                log::error!("Failed to get conn for record API {}: {err}", config.name());
-                return err;
-              })
-              .ok()?;
-
-            return match build_record_api(conn, metadata, config.clone()) {
-              Ok(api) => Some((api.api_name().to_string(), api)),
-              Err(err) => {
-                log::error!("Failed to build record API {}: {err}", config.name());
-                None
-              }
-            };
-          })
-          .collect();
-      });
+      return next;
     });
-  }
+  });
 
-  return record_apis;
+  // Give the snapshot a chance to update, otherwise `derived.snapshot()` will return only the
+  // default empty map.
+  let _make_sure_snapshot_is_valid = derived.ptr().await;
+
+  return derived;
 }
 
 fn build_record_api(
@@ -809,6 +823,7 @@ fn build_auth_config(config: &Config) -> AuthConfig {
         return match name {
           "discord" => "discord.svg",
           "facebook" => "facebook.svg",
+          "github" => "github.svg",
           "gitlab" => "gitlab.svg",
           "google" => "google.svg",
           "microsoft" => "microsoft.svg",

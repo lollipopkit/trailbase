@@ -15,6 +15,7 @@ pub(crate) mod read_queries;
 pub(crate) mod read_record;
 pub(crate) mod subscribe;
 pub(crate) mod test_utils;
+pub(crate) mod util;
 pub(crate) mod write_queries;
 
 mod error;
@@ -43,7 +44,7 @@ use crate::constants::{RECORD_API_PATH, TRANSACTION_API_PATH};
   update_record::update_record_handler,
   delete_record::delete_record_handler,
   json_schema::json_schema_handler,
-  subscribe::add_subscription_sse_handler,
+  subscribe::handler::add_subscription_sse_and_ws_handler,
 ))]
 pub(super) struct RecordOpenApi;
 
@@ -83,7 +84,7 @@ pub(crate) fn router(enable_transactions: bool) -> Router<AppState> {
     )
     .route(
       &format!("/{RECORD_API_PATH}/{{name}}/subscribe/{{record}}"),
-      get(subscribe::add_subscription_sse_handler),
+      get(subscribe::handler::add_subscription_sse_and_ws_handler),
     );
 
   if enable_transactions {

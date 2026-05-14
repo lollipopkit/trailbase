@@ -49,7 +49,7 @@ enum OAuthProviderId {
   MICROSOFT = 14;
   TWITCH = 15;
   YANDEX = 16;
-  WECHAT = 17;
+  GITHUB = 17;
 }
 
 message OAuthProviderConfig {
@@ -103,6 +103,9 @@ message AuthConfig {
   /// This is useful for mobile apps, desktop or SPAs where an app registers a
   /// custom scheme for calls it wants to handle.
   repeated string custom_uri_schemes = 21;
+
+  /// List of explicitly allowed redirect uris.
+  repeated string redirect_uri_allowlist = 22;
 }
 
 message S3StorageConfig {
@@ -134,8 +137,19 @@ message ServerConfig {
   /// If present will use S3 setup over local file-system based storage.
   optional S3StorageConfig s3_storage_config = 13;
 
-  /// If enabled, batches of transactions can be submitted for attomic execution
+  /// If enabled, batches of transactions can be submitted for atomic execution
   optional bool enable_record_transactions = 14;
+
+  /// Request size limit, default: 10MB.
+  optional uint64 request_size_limit_bytes = 15;
+
+  /// Limits the request per IP per second to auth POST APIs for abuse
+  /// protection. If TrailBase is behind a proxy, make sure to set
+  /// "X-Forwarded-For". Default: disabled.
+  ///
+  /// Note that login endpoints have additional fixed rate limits
+  /// on a per credentials level.
+  optional uint32 auth_ip_rate_limit = 16;
 }
 
 enum SystemJobId {

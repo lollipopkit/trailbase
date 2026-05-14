@@ -46,7 +46,10 @@ pub(crate) async fn delete_row(
   let ConnectionEntry {
     connection: conn,
     metadata,
-  } = state.connection_manager().get_entry_for_qn(table_name)?;
+  } = state
+    .connection_manager()
+    .get_entry_for_qn(table_name)
+    .await?;
 
   let Some(table_metadata) = metadata.get_table(table_name) else {
     return Err(Error::Precondition(format!(
@@ -216,11 +219,9 @@ mod tests {
       Uuid::from_slice(&row.myid).unwrap()
     };
 
-    let count = || async {
+    let count = async || -> i64 {
       conn
-        .read_query_row_f(format!("SELECT COUNT(*) FROM '{table_name}'"), (), |row| {
-          row.get::<_, i64>(0)
-        })
+        .read_query_row_get(format!("SELECT COUNT(*) FROM '{table_name}'"), (), 0)
         .await
         .unwrap()
         .unwrap()
